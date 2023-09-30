@@ -1,21 +1,26 @@
+/// The index of a word in a KCAS operation.
+pub(crate) type WordNum = usize;
+
 /// A monotonically increasing counter used to identify a single KCAS operation.
 ///
 /// The number of bits available for the sequence number depends on the length of a word on the
 /// target platform as well as the maximum number of threads configured for any particular
 /// [KCasState]. See [ThreadAndSequence] for more information.
-pub(crate) type SequenceNumber = usize;
+pub(crate) type SequenceNum = usize;
 
 /// An identifier for a thread which performs multi-word CAS operations.
 ///
 /// ThreadIds should be assigned incrementally starting from 1.
 pub(crate) type ThreadId = usize;
 
-/// A usize which combines a [Stage] in the 3 most significant bits and a [SequenceNumber] in the
+pub(crate) type ThreadIndex = usize;
+
+/// A usize which combines a [Stage] in the 3 most significant bits and a [SequenceNum] in the
 /// remaining bits. This allows us to CAS both pieces of information in one operation.
 pub(crate) type StageAndSequence = usize;
 
 
-/// A usize which stores a [ThreadId] in its most significant bits and a [SequenceNumber] in the
+/// A usize which stores a [ThreadId] in its most significant bits and a [SequenceNum] in the
 /// remaining bits.
 ///
 /// The number of bits taken up by `ThreadId` depends on the maximum number of threads specified

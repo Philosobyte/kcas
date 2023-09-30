@@ -3,10 +3,10 @@
 extern crate alloc;
 
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-use crate::err::{AcquireError, ConcurrentChangeError, FatalError, OutOfBoundsStageError, KCasError, RevertError, SetError};
+use crate::err::{ClaimError, ConcurrentChangeError, FatalError, StageOutOfBoundsError, KCasError, RevertError, SetError};
 use crate::err::KCasError::FatalInternalError;
 use crate::stage::{Stage, STATUS_BIT_LENGTH};
-use crate::aliases::{SequenceNumber, StageAndSequence, ThreadAndSequence, ThreadId};
+use crate::aliases::{SequenceNum, StageAndSequence, ThreadAndSequence, ThreadId};
 
 #[cfg(test)]
 use std::sync::mpsc::channel;
@@ -14,6 +14,7 @@ use std::sync::mpsc::channel;
 mod err;
 mod stage;
 mod aliases;
+mod kcasv2;
 
 /// The components for a single CAS operation.
 #[derive(Debug, Eq, PartialEq)]
@@ -96,7 +97,7 @@ fn get_sequence_mask_for_thread_and_sequence(num_threads_bit_length: usize) -> u
 ///
 /// The `Stage` takes up the [STATUS_BIT_LENGTH] most significant bits, and the sequence number
 /// takes up the rest.
-fn combine_stage_and_sequence(stage: Stage, sequence: SequenceNumber) -> StageAndSequence {
+fn combine_stage_and_sequence(stage: Stage, sequence: SequenceNum) -> StageAndSequence {
     (stage as usize) << (usize::BITS as usize - STATUS_BIT_LENGTH) | sequence
 }
 
@@ -104,7 +105,7 @@ fn combine_stage_and_sequence(stage: Stage, sequence: SequenceNumber) -> StageAn
 /// The `Stage` is obtained from the [STATUS_BIT_LENGTH] most significant bits.
 fn extract_stage_from_stage_and_sequence(
     stage_and_sequence: StageAndSequence
-) -> Result<Stage, OutOfBoundsStageError> {
+) -> Result<Stage, StageOutOfBoundsError> {
     let stage_as_num: usize = stage_and_sequence >> (usize::BITS as usize - STATUS_BIT_LENGTH);
     Stage::try_from(stage_as_num)
 }
@@ -113,13 +114,13 @@ fn extract_stage_from_stage_and_sequence(
 /// The sequence number is obtained from the rest of the bits besides the [STATUS_BIT_LENGTH] most significant.
 fn extract_sequence_from_stage_and_sequence(
     stage_and_sequence: StageAndSequence
-) -> SequenceNumber {
+) -> SequenceNum {
     stage_and_sequence & SEQUENCE_MASK_FOR_STATUS_AND_SEQUENCE
 }
 
 fn combine_thread_id_and_sequence(
     thread_id: ThreadId,
-    sequence: SequenceNumber,
+    sequence: SequenceNum,
     num_threads_bit_length: usize
 ) -> ThreadAndSequence {
     thread_id << (usize::BITS as usize - num_threads_bit_length) | sequence
@@ -135,7 +136,7 @@ fn extract_thread_from_thread_and_sequence(
 fn extract_sequence_from_thread_and_sequence(
     thread_and_sequence: ThreadAndSequence,
     sequence_mask_for_thread_and_sequence: usize
-) -> SequenceNumber {
+) -> SequenceNum {
     thread_and_sequence & sequence_mask_for_thread_and_sequence
 }
 
@@ -144,10 +145,10 @@ fn verify_stage_and_sequence_have_not_changed<const NUM_THREADS: usize, const NU
     current_word_num: usize,
     thread_index: usize,
     expected_stage: Stage,
-    expected_sequence: SequenceNumber,
+    expected_sequence: SequenceNum,
 ) -> Result<(), ConcurrentChangeError> {
     let current_stage_and_sequence: StageAndSequence = thread_state.stage_and_sequence_numbers[thread_index].load(Ordering::Acquire);
-    let current_sequence: SequenceNumber = extract_sequence_from_stage_and_sequence(current_stage_and_sequence);
+    let current_sequence: SequenceNum = extract_sequence_from_stage_and_sequence(current_stage_and_sequence);
     let current_stage: Stage = extract_stage_from_stage_and_sequence(current_stage_and_sequence)?;
 
     if current_sequence != expected_sequence {
@@ -158,11 +159,6 @@ fn verify_stage_and_sequence_have_not_changed<const NUM_THREADS: usize, const NU
     }
     Ok(())
 }
-
-// fn verify_value_is_not_thread_and_sequence<const NUM_THREADS: usize, const NUM_WORDS: usize>(
-// ) -> Result<(), KCasError> {
-//     value:
-// }
 
 fn kcas<const NUM_THREADS: usize, const NUM_WORDS: usize>(
     kcas_state: &KCasState<NUM_THREADS, NUM_WORDS>,
@@ -186,7 +182,7 @@ fn kcas<const NUM_THREADS: usize, const NUM_WORDS: usize>(
         kcas_state.desired_elements[thread_index][row_num].store(cas_row.desired_element, Ordering::Release);
     }
     let original_stage_and_sequence: StageAndSequence = kcas_state.stage_and_sequence_numbers[thread_index].load(Ordering::Acquire);
-    let sequence: SequenceNumber = extract_sequence_from_stage_and_sequence(original_stage_and_sequence);
+    let sequence: SequenceNum = extract_sequence_from_stage_and_sequence(original_stage_and_sequence);
 
     // now we are ready to start "acquiring" slots
     let acquiring_stage_and_sequence: StageAndSequence = combine_stage_and_sequence(Stage::Claiming, sequence);
@@ -203,7 +199,7 @@ fn kcas<const NUM_THREADS: usize, const NUM_WORDS: usize>(
         },
         Err(acquire_error) => {
             match acquire_error {
-                AcquireError::ConcurrentChangeError(concurrent_change_error) => {
+                ClaimError::ConcurrentChangeError(concurrent_change_error) => {
                     // depends on what the concurrent change was
                     match concurrent_change_error {
                         ConcurrentChangeError::StageChanged { current_word_num, current_stage } => {
@@ -248,11 +244,11 @@ fn kcas<const NUM_THREADS: usize, const NUM_WORDS: usize>(
                     }
 
                 }
-                AcquireError::ValueWasDifferentThread { current_word_num, other_thread_id, other_sequence_num } => {
+                ClaimError::ValueWasDifferentThread { current_word_num, other_thread_id, other_sequence_num } => {
                     // help thread
                     Err(KCasError::HadToHelpThread)
                 }
-                AcquireError::ValueWasNotExpectedValue { current_word_num, actual_value } => {
+                ClaimError::ValueWasNotExpectedValue { current_word_num, actual_value } => {
                     // transition state to reverting
                     match transition_stage_from_acquiring_to_reverting(kcas_state, thread_id, sequence, acquiring_stage_and_sequence) {
                         ContinueOrReturnEarly::Continue => {}
@@ -261,7 +257,7 @@ fn kcas<const NUM_THREADS: usize, const NUM_WORDS: usize>(
                     revert_and_reset(kcas_state, thread_id, sequence, current_word_num)?;
                     Err(KCasError::ValueWasNotExpectedValue)
                 }
-                AcquireError::InvalidPointer => {
+                ClaimError::InvalidPointer => {
                     Err(FatalInternalError(FatalError::InvalidPointer))
                 }
             }
@@ -272,7 +268,7 @@ fn kcas<const NUM_THREADS: usize, const NUM_WORDS: usize>(
 fn transition_stage_from_acquiring_to_reverting<const NUM_THREADS: usize, const NUM_WORDS: usize>(
     kcas_state: &KCasState<NUM_THREADS, NUM_WORDS>,
     thread_id: ThreadId,
-    sequence: SequenceNumber,
+    sequence: SequenceNum,
     acquiring_stage_and_sequence: StageAndSequence,
 ) -> ContinueOrReturnEarly {
     let thread_index = thread_id - 1;
@@ -291,7 +287,7 @@ fn transition_stage_from_acquiring_to_reverting<const NUM_THREADS: usize, const 
                     return ContinueOrReturnEarly::ReturnEarly(Err(FatalInternalError(FatalError::OutOfBoundsStage(out_of_bounds_stage_error.0))));
                 }
             };
-            let actual_sequence: SequenceNumber = extract_sequence_from_stage_and_sequence(actual_stage_and_sequence);
+            let actual_sequence: SequenceNum = extract_sequence_from_stage_and_sequence(actual_stage_and_sequence);
             if actual_sequence != sequence {
                 return ContinueOrReturnEarly::ReturnEarly(Err(FatalError::ThreadSequenceModifiedByAnotherThread { thread_id }.into()));
             }
@@ -343,7 +339,7 @@ enum ContinueOrReturnEarly {
 fn transition_stage_from_acquiring_to_setting<const NUM_THREADS: usize, const NUM_WORDS: usize>(
     kcas_state: &KCasState<NUM_THREADS, NUM_WORDS>,
     thread_id: ThreadId,
-    sequence: SequenceNumber,
+    sequence: SequenceNum,
     acquiring_stage_and_sequence: StageAndSequence,
 ) -> ContinueOrReturnEarly {
     let thread_index = thread_id - 1;
@@ -363,7 +359,7 @@ fn transition_stage_from_acquiring_to_setting<const NUM_THREADS: usize, const NU
                     return ContinueOrReturnEarly::ReturnEarly(Err(FatalInternalError(FatalError::OutOfBoundsStage(out_of_bounds_stage_error.0))));
                 }
             };
-            let actual_sequence: SequenceNumber = extract_sequence_from_stage_and_sequence(actual_stage_and_sequence);
+            let actual_sequence: SequenceNum = extract_sequence_from_stage_and_sequence(actual_stage_and_sequence);
             if actual_sequence != sequence {
                 return ContinueOrReturnEarly::ReturnEarly(Err(FatalError::ThreadSequenceModifiedByAnotherThread { thread_id }.into()));
             }
@@ -417,7 +413,7 @@ fn transition_stage_from_acquiring_to_setting<const NUM_THREADS: usize, const NU
 fn set_and_reset<const NUM_THREADS: usize, const NUM_WORDS: usize>(
     kcas_state: &KCasState<NUM_THREADS, NUM_WORDS>,
     thread_id: ThreadId,
-    sequence: SequenceNumber,
+    sequence: SequenceNum,
     starting_word_num: usize,
 ) -> Result<(), FatalError> {
     match set(kcas_state, thread_id, sequence, starting_word_num) {
@@ -445,7 +441,7 @@ fn set_and_reset<const NUM_THREADS: usize, const NUM_WORDS: usize>(
                         ConcurrentChangeError::SequenceChanged { .. } => {
                             Err(FatalError::ThreadSequenceModifiedByAnotherThread { thread_id })
                         }
-                        ConcurrentChangeError::StageBecameInvalid(OutOfBoundsStageError(invalid_stage)) => {
+                        ConcurrentChangeError::StageBecameInvalid(StageOutOfBoundsError(invalid_stage)) => {
                             Err(FatalError::OutOfBoundsStage(invalid_stage))
                         }
                     }
@@ -464,7 +460,7 @@ fn set_and_reset<const NUM_THREADS: usize, const NUM_WORDS: usize>(
 fn revert_and_reset<const NUM_THREADS: usize, const NUM_WORDS: usize>(
     kcas_state: &KCasState<NUM_THREADS, NUM_WORDS>,
     thread_id: ThreadId,
-    sequence: SequenceNumber,
+    sequence: SequenceNum,
     starting_word_num: usize,
 ) -> Result<(), FatalError> {
     let thread_index = thread_id - 1;
@@ -514,10 +510,10 @@ fn revert_and_reset<const NUM_THREADS: usize, const NUM_WORDS: usize>(
 fn reset_for_next_operation<const NUM_THREADS: usize, const NUM_WORDS: usize>(
     kcas_state: &KCasState<NUM_THREADS, NUM_WORDS>,
     thread_id: ThreadId,
-    sequence: SequenceNumber,
+    sequence: SequenceNum,
 ) {
     let thread_index: usize = thread_id - 1;
-    let next_sequence: SequenceNumber = sequence + 1;
+    let next_sequence: SequenceNum = sequence + 1;
     let next_stage_and_sequence: StageAndSequence = combine_stage_and_sequence(Stage::Inactive, next_sequence);
     kcas_state.stage_and_sequence_numbers[thread_index].store(next_stage_and_sequence, Ordering::Release);
 }
@@ -525,9 +521,9 @@ fn reset_for_next_operation<const NUM_THREADS: usize, const NUM_WORDS: usize>(
 fn acquire<const NUM_THREADS: usize, const NUM_WORDS: usize>(
     kcas_state: &KCasState<NUM_THREADS, NUM_WORDS>,
     thread_id: ThreadId,
-    sequence: SequenceNumber,
+    sequence: SequenceNum,
     starting_word_num: usize,
-) -> Result<(), AcquireError> {
+) -> Result<(), ClaimError> {
     let thread_index: usize = thread_id - 1;
     let thread_and_sequence: ThreadAndSequence = combine_thread_id_and_sequence(thread_id, sequence, kcas_state.num_threads_bit_length);
 
@@ -535,7 +531,7 @@ fn acquire<const NUM_THREADS: usize, const NUM_WORDS: usize>(
     while current_word_num < NUM_WORDS {
         let target_address: &AtomicPtr<AtomicUsize> = &kcas_state.target_addresses[thread_index][current_word_num];
         let target_address: *mut AtomicUsize = target_address.load(Ordering::Acquire);
-        let target_reference: &AtomicUsize = unsafe { target_address.as_ref().ok_or_else(|| AcquireError::InvalidPointer)? };
+        let target_reference: &AtomicUsize = unsafe { target_address.as_ref().ok_or_else(|| ClaimError::InvalidPointer)? };
 
         let expected_element: usize = kcas_state.expected_elements[thread_index][current_word_num].load(Ordering::Acquire);
 
@@ -559,9 +555,9 @@ fn acquire<const NUM_THREADS: usize, const NUM_WORDS: usize>(
                 let possibly_other_thread_id: ThreadId = extract_thread_from_thread_and_sequence(thread_and_sequence, kcas_state.num_threads_bit_length);
                 if possibly_other_thread_id != 0 {
                     let other_sequence_num = extract_sequence_from_thread_and_sequence(thread_and_sequence, kcas_state.sequence_mask_for_thread_and_sequence);
-                    return Err(AcquireError::ValueWasDifferentThread { current_word_num, other_thread_id: possibly_other_thread_id, other_sequence_num, });
+                    return Err(ClaimError::ValueWasDifferentThread { current_word_num, other_thread_id: possibly_other_thread_id, other_sequence_num, });
                 }
-                return Err(AcquireError::ValueWasNotExpectedValue { current_word_num, actual_value });
+                return Err(ClaimError::ValueWasNotExpectedValue { current_word_num, actual_value });
             }
         }
     }
@@ -571,7 +567,7 @@ fn acquire<const NUM_THREADS: usize, const NUM_WORDS: usize>(
 fn set<const NUM_THREADS: usize, const NUM_WORDS: usize>(
     kcas_state: &KCasState<NUM_THREADS, NUM_WORDS>,
     thread_id: ThreadId,
-    sequence: SequenceNumber,
+    sequence: SequenceNum,
     starting_word_num: usize,
 ) -> Result<(), SetError> {
     let thread_index: usize = thread_id - 1;
@@ -612,7 +608,7 @@ fn set<const NUM_THREADS: usize, const NUM_WORDS: usize>(
 fn revert<const NUM_THREADS: usize, const NUM_WORDS: usize>(
     kcas_state: &KCasState<NUM_THREADS, NUM_WORDS>,
     thread_id: ThreadId,
-    sequence: SequenceNumber,
+    sequence: SequenceNum,
     starting_word_num: usize,
 ) -> Result<(), RevertError> {
     let thread_index: usize = thread_id - 1;

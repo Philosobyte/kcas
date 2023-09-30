@@ -1,5 +1,5 @@
 use core::fmt::{Display, Formatter};
-use crate::err::{KCasError, OutOfBoundsStageError};
+use crate::err::{KCasError, StageOutOfBoundsError};
 
 /// The stage of a thread's current multi-word CAS operation.
 ///
@@ -45,9 +45,9 @@ impl Display for Stage {
 }
 
 impl TryFrom<usize> for Stage {
-    type Error = OutOfBoundsStageError;
+    type Error = StageOutOfBoundsError;
 
-    fn try_from(stage: usize) -> Result<Self, OutOfBoundsStageError> {
+    fn try_from(stage: usize) -> Result<Self, StageOutOfBoundsError> {
         match stage {
             i if i == Stage::Inactive as usize => Ok(Stage::Inactive),
             i if i == Stage::Claiming as usize => Ok(Stage::Claiming),
@@ -55,7 +55,7 @@ impl TryFrom<usize> for Stage {
             i if i == Stage::Reverting as usize => Ok(Stage::Reverting),
             i if i == Stage::Successful as usize => Ok(Stage::Successful),
             i if i == Stage::Reverted as usize => Ok(Stage::Reverted),
-            i => Err(OutOfBoundsStageError(i))
+            i => Err(StageOutOfBoundsError(i))
         }
     }
 }

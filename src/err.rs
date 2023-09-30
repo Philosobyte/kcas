@@ -1,6 +1,6 @@
 use core::fmt::{Arguments, Display, Formatter, Pointer, Write};
 use crate::stage::Stage;
-use crate::aliases::{SequenceNumber, ThreadId};
+use crate::aliases::{SequenceNum, ThreadId};
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum KCasError {
@@ -70,15 +70,15 @@ impl From<FatalError> for KCasError {
 // }
 
 #[derive(Debug, Eq, PartialEq)]
-pub struct OutOfBoundsStageError(pub(crate) usize);
+pub struct StageOutOfBoundsError(pub(crate) usize);
 
-impl From<OutOfBoundsStageError> for FatalError {
-    fn from(value: OutOfBoundsStageError) -> Self {
+impl From<StageOutOfBoundsError> for FatalError {
+    fn from(value: StageOutOfBoundsError) -> Self {
         FatalError::OutOfBoundsStage(value.0)
     }
 }
 
-impl Display for OutOfBoundsStageError {
+impl Display for StageOutOfBoundsError {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         let a = format_args!("Attempted to parse {} as a stage, but it is not a valid stage", self.0);
         f.write_fmt(format_args!("Attempted to parse {} as a stage, but it is not a valid stage", self.0))
@@ -88,12 +88,12 @@ impl Display for OutOfBoundsStageError {
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum ConcurrentChangeError {
     StageChanged { current_word_num: usize, current_stage: Stage },
-    SequenceChanged { current_word_num: usize, current_sequence: SequenceNumber },
-    StageBecameInvalid(OutOfBoundsStageError)
+    SequenceChanged { current_word_num: usize, current_sequence: SequenceNum },
+    StageBecameInvalid(StageOutOfBoundsError)
 }
 
-impl From<OutOfBoundsStageError> for ConcurrentChangeError {
-    fn from(invalid_stage_error: OutOfBoundsStageError) -> Self {
+impl From<StageOutOfBoundsError> for ConcurrentChangeError {
+    fn from(invalid_stage_error: StageOutOfBoundsError) -> Self {
         Self::StageBecameInvalid(invalid_stage_error)
     }
 }
@@ -115,33 +115,33 @@ impl Display for ConcurrentChangeError {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) enum AcquireError {
+pub(crate) enum ClaimError {
     ConcurrentChangeError(ConcurrentChangeError),
-    ValueWasDifferentThread { current_word_num: usize, other_thread_id: ThreadId, other_sequence_num: SequenceNumber },
+    ValueWasDifferentThread { current_word_num: usize, other_thread_id: ThreadId, other_sequence_num: SequenceNum },
     ValueWasNotExpectedValue { current_word_num: usize, actual_value: usize },
     InvalidPointer,
 }
 
-impl Display for AcquireError {
+impl Display for ClaimError {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         match self {
-            AcquireError::ConcurrentChangeError(concurrent_change_error) => {
+            ClaimError::ConcurrentChangeError(concurrent_change_error) => {
                 f.write_fmt(format_args!("State changed unexpectedly while acquiring slots: {}", concurrent_change_error))
             }
-            AcquireError::ValueWasDifferentThread { other_thread_id, other_sequence_num, .. } => {
+            ClaimError::ValueWasDifferentThread { other_thread_id, other_sequence_num, .. } => {
                 f.write_fmt(format_args!("Could not acquire slot because it contained a marker for thread {} and sequence {}", other_thread_id, other_sequence_num))
             }
-            AcquireError::ValueWasNotExpectedValue { actual_value, .. } => {
+            ClaimError::ValueWasNotExpectedValue { actual_value, .. } => {
                 f.write_fmt(format_args!("Could not acquire slot because the actual value was not the expected value: {}", actual_value))
             }
-            AcquireError::InvalidPointer => {
+            ClaimError::InvalidPointer => {
                 f.write_str("Could not acquire slot because a pointer was invalid")
             }
         }
     }
 }
 
-impl From<ConcurrentChangeError> for AcquireError {
+impl From<ConcurrentChangeError> for ClaimError {
     fn from(concurrent_change_error: ConcurrentChangeError) -> Self {
         Self::ConcurrentChangeError(concurrent_change_error)
     }
