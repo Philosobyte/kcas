@@ -1,25 +1,86 @@
-use core::fmt::{Display, Formatter, Pointer, Write};
+use core::fmt::{Arguments, Display, Formatter, Pointer, Write};
 use crate::stage::Stage;
-use crate::types::{SequenceNumber, ThreadId};
+use crate::aliases::{SequenceNumber, ThreadId};
 
 #[derive(Debug, Eq, PartialEq)]
-pub enum KCasError<'a> {
-    InternalError(&'a str)
+pub enum KCasError {
+    FatalInternalError(FatalError),
+    ValueWasNotExpectedValue,
+    HadToHelpThread,
 }
 
-impl<'a> Display for KCasError<'a> {
+#[derive(Debug, Eq, PartialEq)]
+pub enum FatalError {
+    IllegalStageTransition { original_stage: Stage, next_stage: Stage },
+    ThreadSequenceModifiedByAnotherThread { thread_id: ThreadId },
+    OutOfBoundsStage(usize),
+    CASFailedWhileFinalizingSlots,
+    IllegalState,
+    InvalidPointer,
+}
+
+impl Display for FatalError {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::InternalError(s) => f.write_str(s)
+            FatalError::IllegalStageTransition { original_stage, next_stage } => {
+                f.write_fmt(format_args!("Stage illegally transitioned from {} to {}", original_stage, next_stage))
+            }
+            FatalError::ThreadSequenceModifiedByAnotherThread { thread_id } => {
+                f.write_fmt(format_args!("Thread sequence for thread {} was changed by another thread, which is not supposed to be possible", thread_id))
+            }
+            FatalError::OutOfBoundsStage(invalid_stage) => {
+                f.write_fmt(format_args!("Attempted to deserialize a stage which is out of bounds: {}", invalid_stage))
+            }
+            FatalError::CASFailedWhileFinalizingSlots => {
+                f.write_fmt(format_args!("CAS failed while finalizing a slot which was already acquired"))
+            }
+            FatalError::IllegalState => {
+                f.write_fmt(format_args!("Invalid state"))
+            }
+            FatalError::InvalidPointer => {
+                f.write_fmt(format_args!("A pointer was invalid"))
+            }
         }
     }
 }
+impl From<FatalError> for KCasError {
+    fn from(value: FatalError) -> Self {
+        KCasError::FatalInternalError(value)
+    }
+}
+
+// impl<'a> Display for KCasError<'a> {
+//     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+//         match self {
+//             Self::FatalInternalError(arguments) => f.write_fmt(*arguments)
+//         }
+//     }
+// }
+
+// impl<'a> Into<KCasError<'a>> for ConcurrentChangeError {
+//     fn into(self) -> KCasError<'a> {
+//         match self {
+//             ConcurrentChangeError::StageChanged { current_word_num, current_stage } => {
+//
+//             }
+//             ConcurrentChangeError::SequenceChanged { .. } => {}
+//             ConcurrentChangeError::StageBecameInvalid(_) => {}
+//         }
+//     }
+// }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct InvalidStageError(usize);
+pub struct OutOfBoundsStageError(pub(crate) usize);
 
-impl Display for InvalidStageError {
+impl From<OutOfBoundsStageError> for FatalError {
+    fn from(value: OutOfBoundsStageError) -> Self {
+        FatalError::OutOfBoundsStage(value.0)
+    }
+}
+
+impl Display for OutOfBoundsStageError {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        let a = format_args!("Attempted to parse {} as a stage, but it is not a valid stage", self.0);
         f.write_fmt(format_args!("Attempted to parse {} as a stage, but it is not a valid stage", self.0))
     }
 }
@@ -28,11 +89,11 @@ impl Display for InvalidStageError {
 pub(crate) enum ConcurrentChangeError {
     StageChanged { current_word_num: usize, current_stage: Stage },
     SequenceChanged { current_word_num: usize, current_sequence: SequenceNumber },
-    StageBecameInvalid(InvalidStageError)
+    StageBecameInvalid(OutOfBoundsStageError)
 }
 
-impl From<InvalidStageError> for ConcurrentChangeError {
-    fn from(invalid_stage_error: InvalidStageError) -> Self {
+impl From<OutOfBoundsStageError> for ConcurrentChangeError {
+    fn from(invalid_stage_error: OutOfBoundsStageError) -> Self {
         Self::StageBecameInvalid(invalid_stage_error)
     }
 }
@@ -102,7 +163,9 @@ impl Display for SetError {
             SetError::IllegalState => {
                 f.write_fmt(format_args!("Encountered a "))
             }
-            SetError::InvalidPointer => {}
+            SetError::InvalidPointer => {
+                f.write_fmt(format_args!("Encountered a "))
+            }
         }
     }
 }
