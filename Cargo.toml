@@ -7,4 +7,7 @@ edition = "2021"
 
 [dependencies]
 
-displaydoc = { version = "0.2.4", default-features = false }
+#[target.'cfg(loom)'.dependencies]
+#loom = { version = "0.7.0", required = false }
+
+[dev-dependencies]

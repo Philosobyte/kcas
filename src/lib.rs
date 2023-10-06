@@ -15,6 +15,8 @@ mod err;
 mod stage;
 mod aliases;
 mod kcasv2;
+mod kcasv3;
+mod sync;
 
 /// The components for a single CAS operation.
 #[derive(Debug, Eq, PartialEq)]
