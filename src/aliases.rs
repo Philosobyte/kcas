@@ -10,7 +10,17 @@ pub(crate) type SequenceNumber = usize;
 /// ThreadIds should be assigned incrementally starting from 1.
 pub(crate) type ThreadId = usize;
 
-/// A usize which combines a [Stage] in the 3 most significant bits and a [SequenceNumber] in the
+pub(crate) type ThreadIndex = usize;
+
+pub(crate) fn thread_id_to_thread_index(thread_id: ThreadId) -> ThreadIndex {
+    thread_id - 1
+}
+
+pub(crate) fn thread_index_to_thread_id(thread_index: ThreadIndex) -> ThreadId {
+    thread_index + 1
+}
+
+/// A usize which combines a [Stage] in the 3 most significant bits and a [SequenceNum] in the
 /// remaining bits. This allows us to CAS both pieces of information in one operation.
 pub(crate) type StageAndSequence = usize;
 
