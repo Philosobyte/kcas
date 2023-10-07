@@ -1,5 +1,5 @@
-use core::fmt::{Display, Formatter};
 use crate::err::StageOutOfBoundsError;
+use core::fmt::{Display, Formatter};
 
 /// The stage of a thread's current multi-word CAS operation.
 ///
@@ -55,7 +55,7 @@ impl TryFrom<usize> for Stage {
             i if i == Stage::Reverting as usize => Ok(Stage::Reverting),
             i if i == Stage::Successful as usize => Ok(Stage::Successful),
             i if i == Stage::Reverted as usize => Ok(Stage::Reverted),
-            i => Err(StageOutOfBoundsError(i))
+            i => Err(StageOutOfBoundsError(i)),
         }
     }
 }

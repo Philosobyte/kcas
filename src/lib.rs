@@ -5,8 +5,9 @@ extern crate alloc;
 // #[cfg(test)]
 // use std::sync::mpsc::channel;
 
-mod err;
-mod stage;
 mod aliases;
+mod err;
 mod kcas;
+mod stage;
 mod sync;
+mod wrapper;

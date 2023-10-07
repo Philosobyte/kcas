@@ -27,7 +27,6 @@ pub(crate) fn thread_index_to_thread_id(thread_index: ThreadIndex) -> ThreadId {
 /// remaining bits. This allows us to CAS both pieces of information in one operation.
 pub(crate) type StageAndSequence = usize;
 
-
 /// A usize which stores a [ThreadId] in its most significant bits and a [SequenceNum] in the
 /// remaining bits.
 ///

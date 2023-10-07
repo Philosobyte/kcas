@@ -1,6 +1,6 @@
-use core::fmt::{Arguments, Display, Formatter, Pointer, Write};
-use crate::stage::Stage;
 use crate::aliases::{SequenceNum, ThreadId, WordNum};
+use crate::stage::Stage;
+use core::fmt::{Arguments, Display, Formatter, Pointer, Write};
 
 // #[derive(Debug, Eq, PartialEq)]
 // pub enum KCasError {
@@ -83,11 +83,19 @@ impl From<FatalError> for KCasError {
 
 pub enum FatalError {
     StageOutOfBounds(usize),
-    IllegalStageChange { original_stage: Stage, actual_stage: Stage },
+    IllegalStageChange {
+        original_stage: Stage,
+        actual_stage: Stage,
+    },
     IllegalHelpeeStage(Stage),
     TargetAddressWasNotValidPointer(WordNum),
-    SequenceNumChangedByNonOriginalThread { original_thread_id: ThreadId },
-    TriedToSetValueWhichWasNotClaimMarker { word_num: WordNum, actual_value: usize },
+    SequenceNumChangedByNonOriginalThread {
+        original_thread_id: ThreadId,
+    },
+    TriedToSetValueWhichWasNotClaimMarker {
+        word_num: WordNum,
+        actual_value: usize,
+    },
 }
 
 impl From<StageOutOfBoundsError> for FatalError {
