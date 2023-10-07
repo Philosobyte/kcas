@@ -1,5 +1,5 @@
 use core::fmt::{Display, Formatter};
-use crate::err::{KCasError, StageOutOfBoundsError};
+use crate::err::StageOutOfBoundsError;
 
 /// The stage of a thread's current multi-word CAS operation.
 ///
