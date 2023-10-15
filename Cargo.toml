@@ -7,10 +7,19 @@ resolver = "2"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+displaydoc = { version = "0.2.4", default-features = false }
+tracing = { version = "0.1.39", required = false }
+shuttle = { version = "0.6.1", required = false }
 
 [target.'cfg(loom)'.dependencies]
-loom = { version = "0.7.0", required = false }
+loom = { version = "0.7.1", features = ["checkpoint"] }
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3.17", features = ["env-filter", "fmt"] }
+test-log = { version = "0.2.13", default-features = false, features = ["trace"] }
 
 [features]
-std = []
+default = ["std", "alloc"]
 alloc = []
+std = []
+

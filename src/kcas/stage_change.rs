@@ -1,30 +1,35 @@
-use crate::aliases::{
-    thread_index_to_thread_id, SequenceNum, StageAndSequence, ThreadAndSequence, ThreadIndex,
-};
-use crate::err::{FatalError, KCasError, StageOutOfBoundsError};
+use core::fmt::Debug;
+use crate::err::{Error, FatalError, StageOutOfBoundsError};
 use crate::kcas::revert::{help_revert_and_transition, revert_and_transition};
 use crate::kcas::set::{help_set_and_transition, set_and_transition};
 use crate::kcas::{
-    combine_stage_and_sequence, extract_sequence_from_stage_and_sequence,
-    extract_stage_from_stage_and_sequence, reset_for_next_operation, HelpError, State,
+    construct_stage_and_sequence, extract_sequence_from_stage_and_sequence,
+    extract_stage_from_stage_and_sequence, prepare_for_next_operation, HelpError, State,
 };
-use crate::stage::Stage;
 use crate::sync::Ordering;
+use crate::types::{convert_thread_index_to_thread_id, SequenceNum, Stage, StageAndSequence, ThreadAndSequence, ThreadIndex, convert_thread_id_to_thread_index};
+use displaydoc::Display;
 
+#[cfg(feature = "tracing")]
+use tracing::instrument;
+
+#[derive(Debug, Display)]
 pub(super) enum StageAndSequenceVerificationError {
+    /// The KCAS operation's stage was changed by another thread to {actual_stage}.
     StageChanged { actual_stage: Stage },
+    /// The KCAS operation's sequence number was advanced by another thread to {actual_sequence}.
     SequenceChanged { actual_sequence: SequenceNum },
-    StageOutOfBounds { actual_stage_number: usize },
+    /// Tried to deserialize a number as a stage, but it does not correlate to a valid stage: {0}
+    StageOutOfBounds(usize),
 }
 
 impl From<StageOutOfBoundsError> for StageAndSequenceVerificationError {
     fn from(stage_out_of_bounds_error: StageOutOfBoundsError) -> Self {
-        Self::StageOutOfBounds {
-            actual_stage_number: stage_out_of_bounds_error.0,
-        }
+        Self::StageOutOfBounds(stage_out_of_bounds_error.0)
     }
 }
 
+#[cfg_attr(feature = "tracing", instrument)]
 pub(super) fn verify_stage_and_sequence_have_not_changed<
     const NUM_THREADS: usize,
     const NUM_WORDS: usize,
@@ -36,6 +41,7 @@ pub(super) fn verify_stage_and_sequence_have_not_changed<
 ) -> Result<(), StageAndSequenceVerificationError> {
     let actual_stage_and_sequence: StageAndSequence =
         thread_state.stage_and_sequence_numbers[thread_index].load(Ordering::Acquire);
+
     let actual_sequence: SequenceNum =
         extract_sequence_from_stage_and_sequence(actual_stage_and_sequence);
     let actual_stage: Stage = extract_stage_from_stage_and_sequence(actual_stage_and_sequence)?;
@@ -49,21 +55,25 @@ pub(super) fn verify_stage_and_sequence_have_not_changed<
     Ok(())
 }
 
+/// Atomically update the stage in [State] for this operation and, if the update succeeds, call
+/// `next_function`.
+#[cfg_attr(feature = "tracing", instrument(skip(next_function)))]
 pub(super) fn change_stage_and_transition<const NUM_THREADS: usize, const NUM_WORDS: usize, F>(
     shared_state: &State<NUM_THREADS, NUM_WORDS>,
     thread_index: ThreadIndex,
     sequence: SequenceNum,
     thread_and_sequence: ThreadAndSequence,
-    current_stage_and_sequence: StageAndSequence,
     current_stage: Stage,
     desired_stage: Stage,
     next_function: F,
-) -> Result<(), KCasError>
+) -> Result<(), Error>
 where
-    F: FnOnce() -> Result<(), KCasError>,
+    F: FnOnce() -> Result<(), Error>,
 {
+    let current_stage_and_sequence: StageAndSequence =
+        construct_stage_and_sequence(current_stage.clone(), sequence);
     let desired_stage_and_sequence: StageAndSequence =
-        combine_stage_and_sequence(desired_stage, sequence);
+        construct_stage_and_sequence(desired_stage, sequence);
 
     let cas_result: Result<usize, usize> = shared_state.stage_and_sequence_numbers[thread_index]
         .compare_exchange(
@@ -88,9 +98,9 @@ where
             thread_and_sequence,
             NUM_WORDS - 1,
             || {
-                Err(KCasError::Fatal(
-                    FatalError::SequenceNumChangedByNonOriginalThread {
-                        original_thread_id: thread_index_to_thread_id(thread_index),
+                Err(Error::Fatal(
+                    FatalError::SequenceNumChangedByNonOriginatingThread {
+                        originating_thread_id: convert_thread_index_to_thread_id(thread_index),
                     },
                 ))
             },
@@ -106,6 +116,9 @@ where
     )
 }
 
+/// Help another thread update their stage stored in [State] and, if the update is successful, call
+/// `next_function`.
+#[cfg_attr(feature = "tracing", instrument(skip(next_function)))]
 pub(super) fn help_change_stage_and_transition<
     const NUM_THREADS: usize,
     const NUM_WORDS: usize,
@@ -115,7 +128,6 @@ pub(super) fn help_change_stage_and_transition<
     thread_index: ThreadIndex,
     sequence: SequenceNum,
     thread_and_sequence: ThreadAndSequence,
-    current_stage_and_sequence: StageAndSequence,
     current_stage: Stage,
     desired_stage: Stage,
     next_function: F,
@@ -123,8 +135,10 @@ pub(super) fn help_change_stage_and_transition<
 where
     F: FnOnce() -> Result<(), HelpError>,
 {
+    let current_stage_and_sequence: StageAndSequence =
+        construct_stage_and_sequence(current_stage.clone(), sequence);
     let desired_stage_and_sequence: StageAndSequence =
-        combine_stage_and_sequence(desired_stage, sequence);
+        construct_stage_and_sequence(desired_stage, sequence);
 
     let cas_result: Result<usize, usize> = shared_state.stage_and_sequence_numbers[thread_index]
         .compare_exchange(
@@ -148,8 +162,12 @@ where
             thread_index,
             thread_and_sequence,
             NUM_WORDS - 1,
-            || Err(HelpError::SequenceChangedWhileHelping),
-        );
+            || Err(HelpError::SequenceChangedWhileHelping {
+                thread_id: convert_thread_index_to_thread_id(thread_index),
+                original_sequence: sequence,
+                actual_sequence
+            }
+        ));
     }
     help_handle_concurrent_stage_change_and_transition(
         shared_state,
@@ -161,6 +179,9 @@ where
     )
 }
 
+/// Decide how to proceed upon encountering a concurrent stage or sequence change as the originating
+/// thread.
+#[cfg_attr(feature = "tracing", instrument)]
 pub(super) fn handle_concurrent_stage_and_sequence_verification_error_and_transition<
     const NUM_THREADS: usize,
     const NUM_WORDS: usize,
@@ -171,7 +192,7 @@ pub(super) fn handle_concurrent_stage_and_sequence_verification_error_and_transi
     thread_and_sequence: ThreadAndSequence,
     current_stage: Stage,
     error: StageAndSequenceVerificationError,
-) -> Result<(), KCasError> {
+) -> Result<(), Error> {
     match error {
         StageAndSequenceVerificationError::StageChanged { actual_stage } => {
             handle_concurrent_stage_change_and_transition(
@@ -183,19 +204,20 @@ pub(super) fn handle_concurrent_stage_and_sequence_verification_error_and_transi
                 actual_stage,
             )
         }
-        StageAndSequenceVerificationError::SequenceChanged { .. } => Err(KCasError::Fatal(
-            FatalError::SequenceNumChangedByNonOriginalThread {
-                original_thread_id: thread_index_to_thread_id(thread_index),
+        StageAndSequenceVerificationError::SequenceChanged { .. } => Err(Error::Fatal(
+            FatalError::SequenceNumChangedByNonOriginatingThread {
+                originating_thread_id: convert_thread_index_to_thread_id(thread_index),
             },
         )),
-        StageAndSequenceVerificationError::StageOutOfBounds {
-            actual_stage_number,
-        } => Err(KCasError::Fatal(FatalError::StageOutOfBounds(
-            actual_stage_number,
-        ))),
+        StageAndSequenceVerificationError::StageOutOfBounds(actual_stage_number) => Err(
+            Error::Fatal(FatalError::StageOutOfBounds(actual_stage_number)),
+        ),
     }
 }
 
+/// Decide how to proceed upon encountering a concurrent stage or sequence change as a helper
+/// thread.
+#[cfg_attr(feature = "tracing", instrument)]
 pub(super) fn help_handle_concurrent_stage_and_sequence_verification_error_and_transition<
     const NUM_THREADS: usize,
     const NUM_WORDS: usize,
@@ -218,17 +240,21 @@ pub(super) fn help_handle_concurrent_stage_and_sequence_verification_error_and_t
                 actual_stage,
             )
         }
-        StageAndSequenceVerificationError::SequenceChanged { .. } => {
-            Err(HelpError::SequenceChangedWhileHelping)
+        StageAndSequenceVerificationError::SequenceChanged {actual_sequence } => {
+            Err(HelpError::SequenceChangedWhileHelping {
+                thread_id: convert_thread_index_to_thread_id(thread_index),
+                original_sequence: sequence,
+                actual_sequence,
+            })  
         }
-        StageAndSequenceVerificationError::StageOutOfBounds {
-            actual_stage_number,
-        } => Err(HelpError::Fatal(FatalError::StageOutOfBounds(
-            actual_stage_number,
-        ))),
+        StageAndSequenceVerificationError::StageOutOfBounds(actual_stage_number) => Err(
+            HelpError::Fatal(FatalError::StageOutOfBounds(actual_stage_number)),
+        ),
     }
 }
 
+/// Decide how to proceed upon encountering a concurrent stage change as the originating thread.
+#[cfg_attr(feature = "tracing", instrument)]
 pub(super) fn handle_concurrent_stage_change_and_transition<
     const NUM_THREADS: usize,
     const NUM_WORDS: usize,
@@ -239,15 +265,13 @@ pub(super) fn handle_concurrent_stage_change_and_transition<
     thread_and_sequence: ThreadAndSequence,
     current_stage: Stage,
     actual_stage: Stage,
-) -> Result<(), KCasError> {
+) -> Result<(), Error> {
     match actual_stage {
         // not possible - fatal - don't even bother reverting
-        Stage::Inactive | Stage::Claiming => {
-            Err(KCasError::Fatal(FatalError::IllegalStageChange {
-                original_stage: current_stage,
-                actual_stage,
-            }))
-        }
+        Stage::Inactive | Stage::Claiming => Err(Error::Fatal(FatalError::IllegalStageChange {
+            original_stage: current_stage,
+            actual_stage,
+        })),
         Stage::Setting => {
             set_and_transition(shared_state, thread_index, sequence, thread_and_sequence)
         }
@@ -257,8 +281,8 @@ pub(super) fn handle_concurrent_stage_change_and_transition<
             thread_and_sequence,
             NUM_WORDS - 1,
             || {
-                reset_for_next_operation(shared_state, thread_index, sequence);
-                Err(KCasError::ValueWasNotExpectedValue)
+                prepare_for_next_operation(shared_state, thread_index, sequence);
+                Err(Error::ValueWasNotExpectedValue)
             },
         ),
         Stage::Successful => revert_and_transition(
@@ -267,13 +291,15 @@ pub(super) fn handle_concurrent_stage_change_and_transition<
             thread_and_sequence,
             NUM_WORDS - 1,
             || {
-                reset_for_next_operation(shared_state, thread_index, sequence);
+                prepare_for_next_operation(shared_state, thread_index, sequence);
                 Ok(())
             },
         ),
     }
 }
 
+/// Decide how to proceed upon encountering a concurrent stage change as a helper thread.
+#[cfg_attr(feature = "tracing", instrument)]
 pub(super) fn help_handle_concurrent_stage_change_and_transition<
     const NUM_THREADS: usize,
     const NUM_WORDS: usize,
@@ -307,7 +333,6 @@ pub(super) fn help_handle_concurrent_stage_change_and_transition<
                     thread_index,
                     sequence,
                     thread_and_sequence,
-                    combine_stage_and_sequence(Stage::Reverting, sequence),
                     Stage::Reverting,
                     Stage::Reverted,
                     || Ok(()),

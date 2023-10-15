@@ -1,5 +1,4 @@
-use crate::aliases::{SequenceNum, ThreadAndSequence, ThreadIndex, WordNum};
-use crate::err::{FatalError, KCasError};
+use crate::err::{Error, FatalError};
 use crate::kcas::revert::{help_revert_and_transition, revert_and_transition};
 use crate::kcas::set::{help_set_and_transition, set_and_transition};
 use crate::kcas::stage_change::{
@@ -10,77 +9,101 @@ use crate::kcas::stage_change::{
     verify_stage_and_sequence_have_not_changed, StageAndSequenceVerificationError,
 };
 use crate::kcas::{
-    combine_stage_and_sequence, extract_thread_from_thread_and_sequence, help_thread,
-    reset_for_next_operation, HelpError, State,
+    extract_thread_from_thread_and_sequence, help_thread, prepare_for_next_operation, HelpError,
+    State,
 };
-use crate::stage::Stage;
 use crate::sync::{AtomicPtr, AtomicUsize, Ordering};
+use crate::types::{
+    get_bit_length_of_num_threads, SequenceNum, Stage, ThreadAndSequence, ThreadIndex, WordNum,
+};
+use displaydoc::Display;
 
+#[cfg(feature = "tracing")]
+use tracing::instrument;
+
+/// Claim target addresses by swapping out expected values for [ThreadAndSequence] markers. Then,
+/// move on to the [enum@Stage::Setting] stage if all values were expected; otherwise, move on to
+/// [enum@Stage::Reverting].
+#[cfg_attr(feature = "tracing", instrument)]
 pub(super) fn claim_and_transition<const NUM_THREADS: usize, const NUM_WORDS: usize>(
     shared_state: &State<NUM_THREADS, NUM_WORDS>,
     thread_index: ThreadIndex,
     sequence: SequenceNum,
     thread_and_sequence: ThreadAndSequence,
-) -> Result<(), KCasError> {
+) -> Result<(), Error> {
     let claim_result: Result<(), ClaimError> =
         claim(shared_state, thread_index, sequence, thread_and_sequence);
     if claim_result.is_ok() {
-        let stage_and_sequence: ThreadAndSequence =
-            combine_stage_and_sequence(Stage::Claiming, sequence);
+        // change the stage to Setting
         return change_stage_and_transition(
             shared_state,
             thread_index,
             sequence,
             thread_and_sequence,
-            stage_and_sequence,
             Stage::Claiming,
             Stage::Setting,
+            // and then after that, try to set
             || set_and_transition(shared_state, thread_index, sequence, thread_and_sequence),
         );
     }
     match claim_result.unwrap_err() {
-        ClaimError::StageAndSequenceVerificationError {
-            failed_word_num,
-            error,
-        } => handle_concurrent_stage_and_sequence_verification_error_and_transition(
+        ClaimError::StageAndSequenceVerificationError { error, .. } => {
+            handle_concurrent_stage_and_sequence_verification_error_and_transition(
+                shared_state,
+                thread_index,
+                sequence,
+                thread_and_sequence,
+                Stage::Claiming,
+                error,
+            )
+        }
+        // change the stage to Reverting first
+        ClaimError::ValueWasNotExpectedValue { word_num, .. } => change_stage_and_transition(
             shared_state,
             thread_index,
             sequence,
             thread_and_sequence,
-            Stage::Claiming,
-            error,
-        ),
-        ClaimError::ValueWasNotExpectedValue {
-            word_num,
-            actual_value,
-        } => change_stage_and_transition(
-            shared_state,
-            thread_index,
-            sequence,
-            thread_and_sequence,
-            combine_stage_and_sequence(Stage::Claiming, sequence),
             Stage::Claiming,
             Stage::Reverting,
-            || {
-                revert_and_transition(
-                    shared_state,
-                    thread_index,
-                    thread_and_sequence,
-                    word_num,
-                    || {
-                        reset_for_next_operation(shared_state, thread_index, sequence);
-                        Err(KCasError::ValueWasNotExpectedValue)
-                    },
-                )
-            },
+            // then revert
+            ||  revert_and_transition(
+                shared_state,
+                thread_index,
+                thread_and_sequence,
+                word_num,
+                || {
+                    // then skip setting the stage to Reverted and just reset state
+                    prepare_for_next_operation(shared_state, thread_index, sequence);
+                    Err(Error::ValueWasNotExpectedValue)
+                },
+            ),
         ),
-        ClaimError::TargetAddressWasNotValidPointer(failed_word_num) => Err(KCasError::Fatal(
-            FatalError::TargetAddressWasNotValidPointer(failed_word_num),
-        )),
-        ClaimError::FatalErrorWhileHelping(fatal_error) => Err(KCasError::Fatal(fatal_error)),
+        ClaimError::TargetAddressWasNotValidPointer {
+            word_num,
+            target_address,
+        } => Err(Error::Fatal(FatalError::TargetAddressWasNotValidPointer {
+            word_num,
+            target_address,
+        })),
+        ClaimError::FatalErrorWhileHelping(fatal_error) => Err(Error::Fatal(fatal_error)),
+        ClaimError::TopBitsOfValueWereIllegal {
+            word_num,
+            target_address,
+            value,
+            num_reserved_bits,
+        } => Err(Error::Fatal(FatalError::TopBitsOfValueWereIllegal {
+            word_num,
+            target_address,
+            value,
+            num_reserved_bits,
+        })),
     }
 }
 
+/// Help another thread claim target addresses by swapping out expected values for
+/// [ThreadAndSequence] markers. Then, move on to the [enum@Stage::Setting] stage if all values were
+/// expected; otherwise, move on to [enum@Stage::Reverting].
+#[cfg_attr(feature = "tracing", instrument)]
 pub(super) fn help_claim_and_transition<const NUM_THREADS: usize, const NUM_WORDS: usize>(
     shared_state: &State<NUM_THREADS, NUM_WORDS>,
     thread_index: ThreadIndex,
@@ -90,14 +113,11 @@ pub(super) fn help_claim_and_transition<const NUM_THREADS: usize, const NUM_WORD
     let claim_result: Result<(), ClaimError> =
         claim(shared_state, thread_index, sequence, thread_and_sequence);
     if claim_result.is_ok() {
-        let stage_and_sequence: ThreadAndSequence =
-            combine_stage_and_sequence(Stage::Claiming, sequence);
         return help_change_stage_and_transition(
             shared_state,
             thread_index,
             sequence,
             thread_and_sequence,
-            stage_and_sequence,
             Stage::Claiming,
             Stage::Setting,
             || help_set_and_transition(shared_state, thread_index, sequence, thread_and_sequence),
@@ -105,8 +125,8 @@ pub(super) fn help_claim_and_transition<const NUM_THREADS: usize, const NUM_WORD
     }
     match claim_result.unwrap_err() {
         ClaimError::StageAndSequenceVerificationError {
-            failed_word_num,
             error,
+            ..
         } => help_handle_concurrent_stage_and_sequence_verification_error_and_transition(
             shared_state,
             thread_index,
@@ -115,137 +135,182 @@ pub(super) fn help_claim_and_transition<const NUM_THREADS: usize, const NUM_WORD
             Stage::Claiming,
             error,
         ),
-        ClaimError::ValueWasNotExpectedValue {
-            word_num,
-            actual_value,
-        } => help_change_stage_and_transition(
+        // change the stage to Reverting first
+        ClaimError::ValueWasNotExpectedValue { word_num, .. } => help_change_stage_and_transition(
             shared_state,
             thread_index,
             sequence,
             thread_and_sequence,
-            combine_stage_and_sequence(Stage::Claiming, sequence),
             Stage::Claiming,
             Stage::Reverting,
+            // then revert
             || {
                 help_revert_and_transition(
                     shared_state,
                     thread_index,
                     thread_and_sequence,
                     word_num,
-                    || {
-                        help_change_stage_and_transition(
-                            shared_state,
-                            thread_index,
-                            sequence,
-                            thread_and_sequence,
-                            combine_stage_and_sequence(Stage::Reverting, sequence),
-                            Stage::Reverting,
-                            Stage::Reverted,
-                            || Ok(()),
-                        )
-                    },
+                    // then change the stage to Reverted
+                    || help_change_stage_and_transition(
+                        shared_state,
+                        thread_index,
+                        sequence,
+                        thread_and_sequence,
+                        Stage::Reverting,
+                        Stage::Reverted,
+                        || Ok(()),
+                    ),
                 )
             },
         ),
-        ClaimError::TargetAddressWasNotValidPointer(failed_word_num) => Err(HelpError::Fatal(
-            FatalError::TargetAddressWasNotValidPointer(failed_word_num),
+        ClaimError::TargetAddressWasNotValidPointer {
+            word_num,
+            target_address,
+        } => Err(HelpError::Fatal(
+            FatalError::TargetAddressWasNotValidPointer {
+                word_num,
+                target_address,
+            },
         )),
         ClaimError::FatalErrorWhileHelping(fatal_error) => Err(HelpError::Fatal(fatal_error)),
+        ClaimError::TopBitsOfValueWereIllegal {
+            word_num,
+            target_address,
+            value,
+            num_reserved_bits,
+        } => Err(HelpError::Fatal(FatalError::TopBitsOfValueWereIllegal {
+            word_num,
+            target_address,
+            value,
+            num_reserved_bits,
+        })),
     }
 }
 
+#[derive(Debug, Display)]
 enum ClaimError {
+    /** The stage or sequence changed while attempting to claim the target address at word
+        {failed_word_num}: {error}
+     */
     StageAndSequenceVerificationError {
         failed_word_num: WordNum,
         error: StageAndSequenceVerificationError,
     },
+    /** The value at word number {word_num} and target address {target_address} was not the
+        expected value but was instead: {actual_value}
+     */
     ValueWasNotExpectedValue {
         word_num: WordNum,
+        target_address: usize,
         actual_value: usize,
     },
-    TargetAddressWasNotValidPointer(WordNum),
+    /// The target address at {target_address} for word number {word_num} was not a valid pointer.
+    TargetAddressWasNotValidPointer {
+        word_num: WordNum,
+        target_address: usize,
+    },
+    /// Encountered a fatal error while helping another thread: {0}
     FatalErrorWhileHelping(FatalError),
+    /** Encountered unexpected values for the top {num_reserved_bits} bits of the value {value} at
+        target address {target_address} for word number {word_num}.
+    */
+    TopBitsOfValueWereIllegal {
+        word_num: WordNum,
+        target_address: usize,
+        value: usize,
+        num_reserved_bits: usize,
+    },
 }
 
+/// Claim target addresses by swapping out expected values for [ThreadAndSequence] markers.
+#[cfg_attr(feature = "tracing", instrument)]
 fn claim<const NUM_THREADS: usize, const NUM_WORDS: usize>(
-    shared_state: &State<NUM_THREADS, NUM_WORDS>,
+    state: &State<NUM_THREADS, NUM_WORDS>,
     thread_index: ThreadIndex,
     sequence: SequenceNum,
     thread_and_sequence: ThreadAndSequence,
 ) -> Result<(), ClaimError> {
-    let mut word_num: WordNum = 0;
-    while word_num < NUM_WORDS {
-        let target_address: &AtomicPtr<AtomicUsize> =
-            &shared_state.target_addresses[thread_index][word_num];
-        let target_address: *mut AtomicUsize = target_address.load(Ordering::Acquire);
-        let target_reference: &AtomicUsize = unsafe {
-            target_address
-                .as_ref()
-                .ok_or_else(|| ClaimError::TargetAddressWasNotValidPointer(word_num))?
-        };
+    for word_num in 0..NUM_WORDS {
+        let target_address_ptr: &AtomicPtr<AtomicUsize> =
+            &state.target_addresses[thread_index][word_num];
+        let target_address_ptr: *mut AtomicUsize = target_address_ptr.load(Ordering::Acquire);
+
+        let target_address: &AtomicUsize = unsafe { target_address_ptr.as_ref() }
+            .ok_or(ClaimError::TargetAddressWasNotValidPointer {
+                word_num,
+                target_address: target_address_ptr as usize,
+            })?;
 
         let expected_element: usize =
-            shared_state.expected_elements[thread_index][word_num].load(Ordering::Acquire);
+            state.expected_values[thread_index][word_num].load(Ordering::Acquire);
 
-        match target_reference.compare_exchange(
+        'cas_loop: while let Err(actual_value) = target_address.compare_exchange_weak(
             expected_element,
             thread_and_sequence,
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
-            Ok(_) => {
-                word_num += 1;
+            if actual_value == expected_element {
+                continue 'cas_loop;
             }
-            Err(actual_value) => {
-                if actual_value == thread_and_sequence {
-                    word_num += 1;
-                    continue;
-                }
+            if actual_value == thread_and_sequence {
+                // value is already the marker we wanted
+                break 'cas_loop;
+            }
 
-                if let Err(error) = verify_stage_and_sequence_have_not_changed(
-                    shared_state,
-                    thread_index,
-                    Stage::Claiming,
-                    sequence,
-                ) {
-                    return Err(ClaimError::StageAndSequenceVerificationError {
-                        failed_word_num: word_num,
-                        error,
-                    });
-                }
+            if let Err(error) = verify_stage_and_sequence_have_not_changed(
+                state,
+                thread_index,
+                Stage::Claiming,
+                sequence,
+            ) {
+                return Err(ClaimError::StageAndSequenceVerificationError {
+                    failed_word_num: word_num,
+                    error,
+                });
+            }
 
-                match extract_thread_from_thread_and_sequence(
+            // in case the value is a pointer, canonical pointers typically set all the bits
+            // above virtual address space to either 0 or 1
+            let bit_length_of_num_threads: usize =
+                get_bit_length_of_num_threads::<NUM_THREADS>();
+            let num_sequence_bits: usize = usize::BITS as usize - bit_length_of_num_threads;
+            let top_bits_if_value_is_kernel_pointer: usize = usize::MAX >> num_sequence_bits;
+
+            let top_bits: usize = extract_thread_from_thread_and_sequence::<NUM_THREADS>(actual_value);
+
+            if top_bits == 0 || top_bits == top_bits_if_value_is_kernel_pointer {
+                // happy path for a CAS failure
+                return Err(ClaimError::ValueWasNotExpectedValue {
+                    word_num,
+                    target_address: target_address_ptr as usize,
                     actual_value,
-                    shared_state.num_threads_bit_length,
-                ) {
-                    0 => {
-                        return Err(ClaimError::ValueWasNotExpectedValue {
-                            word_num,
-                            actual_value,
-                        })
+                });
+            } else if top_bits <= NUM_THREADS {
+                // the top bits were a ThreadId
+                let help_result: Result<(), HelpError> = help_thread(state, actual_value);
+                if help_result.is_ok() {
+                    // The other thread's ThreadAndSequence should be gone. Try again.
+                    continue 'cas_loop;
+                }
+                let help_error: HelpError = help_result.unwrap_err();
+                match help_error {
+                    HelpError::SequenceChangedWhileHelping { .. } | HelpError::HelpeeStageIsAlreadyTerminal(..) => {
+                        // Either of these means the other thread's ThreadAndSequence should be
+                        // gone. Try again.
+                        continue 'cas_loop;
                     }
-                    other_thread_id => {
-                        // help thread, then continue
-                        match help_thread(shared_state, actual_value) {
-                            Ok(_) => {
-                                // try this iteration again
-                            }
-                            Err(help_error) => {
-                                match help_error {
-                                    HelpError::SequenceChangedWhileHelping
-                                    | HelpError::HelpeeStageIsAlreadyTerminal(_) => {
-                                        // try this iteration again
-                                    }
-                                    HelpError::Fatal(fatal_error) => {
-                                        return Err(ClaimError::FatalErrorWhileHelping(
-                                            fatal_error,
-                                        ));
-                                    }
-                                }
-                            }
-                        }
+                    HelpError::Fatal(fatal_error) => {
+                        return Err(ClaimError::FatalErrorWhileHelping(fatal_error));
                     }
                 }
+            } else {
+                return Err(ClaimError::TopBitsOfValueWereIllegal {
+                    word_num,
+                    target_address: target_address_ptr as usize,
+                    value: actual_value,
+                    num_reserved_bits: bit_length_of_num_threads,
+                });
             }
         }
     }
