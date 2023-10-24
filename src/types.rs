@@ -98,7 +98,7 @@ pub(crate) type StageAndSequence = usize;
 
 /// The mask to AND with a [StageAndSequence] in order to extract the [SequenceNum].
 pub(crate) const SEQUENCE_MASK_FOR_STAGE_AND_SEQUENCE: usize = {
-    let num_sequence_bits: usize = (usize::BITS as usize - STAGE_BIT_LENGTH);
+    let num_sequence_bits: usize = usize::BITS as usize - STAGE_BIT_LENGTH;
     !(0b111 << num_sequence_bits)
 };
 
@@ -189,15 +189,21 @@ pub(crate) const fn extract_sequence_from_thread_and_sequence<const NUM_THREADS:
 #[cfg(test)]
 #[cfg(feature = "std")]
 mod tests {
-    use crate::types::{construct_stage_and_sequence, SEQUENCE_MASK_FOR_STAGE_AND_SEQUENCE, extract_sequence_from_stage_and_sequence, extract_stage_from_stage_and_sequence, SequenceNum, Stage, StageAndSequence};
+    use crate::types::{
+        construct_stage_and_sequence, extract_sequence_from_stage_and_sequence,
+        extract_stage_from_stage_and_sequence, SequenceNum, Stage, StageAndSequence,
+        SEQUENCE_MASK_FOR_STAGE_AND_SEQUENCE,
+    };
     use test_log::test;
     use tracing::debug;
 
     #[test]
     fn test() {
-        let stage_and_sequence: StageAndSequence = construct_stage_and_sequence(Stage::Successful, 0);
+        let stage_and_sequence: StageAndSequence =
+            construct_stage_and_sequence(Stage::Successful, 0);
         debug!("stage_and_sequence: {stage_and_sequence:?}");
-        let stage: Stage = extract_stage_from_stage_and_sequence(stage_and_sequence).expect("Could not extract");
+        let stage: Stage =
+            extract_stage_from_stage_and_sequence(stage_and_sequence).expect("Could not extract");
         let sequence: SequenceNum = extract_sequence_from_stage_and_sequence(stage_and_sequence);
         debug!("stage: {stage:?}");
         debug!("sequence: {sequence:?}");

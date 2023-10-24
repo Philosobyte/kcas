@@ -14,8 +14,7 @@ use crate::types::{
 use core::sync::atomic::AtomicBool;
 use displaydoc::Display;
 
-#[cfg(feature = "tracing")]
-use tracing::instrument;
+use tracing::{instrument, trace};
 
 mod claim;
 mod revert;
@@ -24,20 +23,24 @@ mod stage_change;
 
 /// A structure containing all the information needed to perform a single CAS operation.
 ///
-/// `target_address` is the mutable reference whose value should be CASed. Values `expected_element`
-/// and `desired_element` can be any usize, including a thin pointer, as long as the most
-/// significant bits are either all 0s or all 1s. The number of bits which must follow this rule is
-/// determined by [fn@crate::types::get_bit_length_of_num_threads] at compile time depending on the
-/// number of desired threads for performing KCAS operations. These bits are used internally by
-/// kcas to differentiate between temporary [ThreadAndSequence] markers and real values.
+/// `target_address` is a reference whose value should be compared and swapped. Values
+/// `expected_element` and `desired_element` can be any usize, including a thin pointer, as long as
+/// the most significant bits are either all 0s or all 1s. The number of bits which must follow
+/// this rule scales with `NUM_THREADS`. For example, on a 64-bit system, if we would like the
+/// lower 52 bits to be free to hold arbitrary content, then the maximum allowed `NUM_THREADS` is
+/// 4096, since that is the largest number which fits in `(64 - 52) = 12` bits.
+///
+/// These bits are used
+/// internally by kcas to differentiate between temporary [ThreadAndSequence] markers and real
+/// values.
 ///
 /// The reason the most significant bits in values are allowed to be either all 0s or all 1s is to
 /// allow sign extension, which is required by canonical pointers in some operating systems.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct KCasWord<'a> {
     target_address: &'a AtomicUsize,
-    expected_element: usize,
-    desired_element: usize,
+    expected_value: usize,
+    desired_value: usize,
 }
 
 impl<'a> KCasWord<'a> {
@@ -48,8 +51,8 @@ impl<'a> KCasWord<'a> {
     ) -> Self {
         Self {
             target_address,
-            expected_element,
-            desired_element,
+            expected_value: expected_element,
+            desired_value: desired_element,
         }
     }
 }
@@ -57,13 +60,12 @@ impl<'a> KCasWord<'a> {
 /// Holds KCAS operation state shared between all threads. This allows threads to help each other.
 ///
 /// [NUM_THREADS] is the maximum number of threads allowed to perform KCAS operations at
-/// any given point in time. Memory allocation at initialization grows linearly with [NUM_THREADS].
-/// Besides wasted memory allocation, it is okay to underutilize the number of threads.
+/// any given point in time. Memory is allocated at initialization for each thread.
 ///
-/// [NUM_WORDS] is the number of [KCasWord]s to CAS during every operation. Memory allocation
-/// at initialization grows linearly with [NUM_WORDS], just like [NUM_THREADS]. It is currently
-/// expected that each KCAS operation involves exactly [NUM_WORDS] words, although support for
-/// supplying fewer than [NUM_WORDS] words is planned.
+/// [NUM_WORDS] is the number of [KCasWord]s to CAS during every operation. Memory is allocated at
+/// initialization for each thread. It is currently expected that each KCAS operation involves
+/// exactly [NUM_WORDS] words, although it may become possible to support operations from 0 to
+/// [NUM_WORDS] in the future.
 #[derive(Debug)]
 pub struct State<const NUM_THREADS: usize, const NUM_WORDS: usize> {
     /// The number of wrappers (typically one per thread) which are currently assigned a [ThreadId]
@@ -107,7 +109,7 @@ impl<const NUM_THREADS: usize, const NUM_WORDS: usize> State<NUM_THREADS, NUM_WO
 }
 
 /// Perform a single KCAS operation on `kcas_words`.
-#[cfg_attr(feature = "tracing", instrument)]
+#[instrument]
 pub(crate) fn kcas<const NUM_THREADS: usize, const NUM_WORDS: usize>(
     shared_state: &State<NUM_THREADS, NUM_WORDS>,
     thread_id: ThreadId,
@@ -119,43 +121,53 @@ pub(crate) fn kcas<const NUM_THREADS: usize, const NUM_WORDS: usize>(
     let thread_and_sequence: ThreadAndSequence =
         construct_thread_and_sequence::<NUM_THREADS>(thread_id, sequence);
     // kick off tree of fn calls
-    claim_and_transition(shared_state, thread_index, sequence, thread_and_sequence)
+    let result = claim_and_transition(shared_state, thread_index, sequence, thread_and_sequence);
+    trace!("result: {result:?}");
+    result
 }
 
 /// Persist information about this operation at [ThreadIndex] which may be needed by other threads
 /// into shared [State].
 ///
 /// Only the originating thread should perform this.
-#[cfg_attr(feature = "tracing", instrument)]
+#[instrument]
 fn initialize_operation<const NUM_THREADS: usize, const NUM_WORDS: usize>(
     state: &State<NUM_THREADS, NUM_WORDS>,
     thread_index: ThreadIndex,
-    mut kcas_words: [KCasWord; NUM_WORDS],
+    kcas_words: [KCasWord; NUM_WORDS],
 ) -> SequenceNum {
     // store all KCasWords into shared state
-    for row_num in 0..kcas_words.len() {
-        let kcas_word: &KCasWord = &kcas_words[row_num];
+    for word_num in 0..kcas_words.len() {
+        let kcas_word: &KCasWord = &kcas_words[word_num];
 
+        trace!("Saving target address for word num {word_num} to shared state");
         let target_address: *mut AtomicUsize =
             kcas_word.target_address as *const AtomicUsize as *mut AtomicUsize;
-        state.target_addresses[thread_index][row_num].store(target_address, Ordering::Release);
+        state.target_addresses[thread_index][word_num].store(target_address, Ordering::Release);
 
-        state.expected_values[thread_index][row_num]
-            .store(kcas_word.expected_element, Ordering::Release);
-        state.desired_values[thread_index][row_num]
-            .store(kcas_word.desired_element, Ordering::Release);
+        trace!("Saving expected value for word num {word_num} to shared state");
+        state.expected_values[thread_index][word_num]
+            .store(kcas_word.expected_value, Ordering::Release);
+
+        trace!("Saving desired value for word num {word_num} to shared state");
+        state.desired_values[thread_index][word_num]
+            .store(kcas_word.desired_value, Ordering::Release);
     }
 
     // change the stage to Claiming
+    trace!("Loading stage and sequence");
     let original_stage_and_sequence: StageAndSequence =
         state.stage_and_sequence_numbers[thread_index].load(Ordering::Acquire);
+
     let sequence: SequenceNum =
         extract_sequence_from_stage_and_sequence(original_stage_and_sequence);
-
     let claiming_stage_and_sequence: StageAndSequence =
         construct_stage_and_sequence(Stage::Claiming, sequence);
+
+    trace!("Saving stage and sequence {claiming_stage_and_sequence} to shared state");
     state.stage_and_sequence_numbers[thread_index]
         .store(claiming_stage_and_sequence, Ordering::Release);
+    trace!("Saved stage and sequence {claiming_stage_and_sequence} to shared state");
 
     sequence
 }
@@ -164,7 +176,7 @@ fn initialize_operation<const NUM_THREADS: usize, const NUM_WORDS: usize>(
 /// for the next operation.
 ///
 /// Only the originating thread should perform this.
-#[cfg_attr(feature = "tracing", instrument)]
+#[instrument]
 fn prepare_for_next_operation<const NUM_THREADS: usize, const NUM_WORDS: usize>(
     thread_state: &State<NUM_THREADS, NUM_WORDS>,
     thread_index: ThreadIndex,
@@ -176,6 +188,7 @@ fn prepare_for_next_operation<const NUM_THREADS: usize, const NUM_WORDS: usize>(
     let next_stage_and_sequence: StageAndSequence =
         construct_stage_and_sequence(Stage::Inactive, next_sequence);
 
+    trace!("Storing stage and sequence {next_stage_and_sequence}");
     thread_state.stage_and_sequence_numbers[thread_index]
         .store(next_stage_and_sequence, Ordering::Release);
 }
@@ -183,17 +196,17 @@ fn prepare_for_next_operation<const NUM_THREADS: usize, const NUM_WORDS: usize>(
 #[derive(Debug, Display)]
 enum HelpError {
     /** While helping thread {thread_id}, its sequence number changed from {original_sequence} to
-        {actual_sequence}.
-     */
+       {actual_sequence}.
+    */
     SequenceChangedWhileHelping {
         thread_id: ThreadId,
         original_sequence: SequenceNum,
-        actual_sequence: SequenceNum
+        actual_sequence: SequenceNum,
     },
 
     /** While helping thread {0}, we discovered that it is already at a terminal stage: {1}
-        such that there is nothing left to do.
-     */
+       such that there is nothing left to do.
+    */
     HelpeeStageIsAlreadyTerminal(ThreadId, Stage),
 
     /// Encountered a fatal error while helping another thread: {0}
@@ -207,7 +220,7 @@ impl From<FatalError> for HelpError {
 }
 
 /// Help another thread perform a KCAS operation.
-#[cfg_attr(feature = "tracing", instrument)]
+#[instrument]
 fn help_thread<const NUM_THREADS: usize, const NUM_WORDS: usize>(
     shared_state: &State<NUM_THREADS, NUM_WORDS>,
     encountered_thread_and_sequence: ThreadAndSequence,
@@ -219,7 +232,7 @@ fn help_thread<const NUM_THREADS: usize, const NUM_WORDS: usize>(
     let encountered_sequence: SequenceNum =
         extract_sequence_from_thread_and_sequence::<NUM_THREADS>(encountered_thread_and_sequence);
 
-    // we need to know what stage the thread is at so we know how to help
+    trace!("Loading stage and sequence so we know how to help thread {thread_id}");
     let stage_and_sequence: StageAndSequence =
         shared_state.stage_and_sequence_numbers[thread_index].load(Ordering::Acquire);
     let stage: Stage = extract_stage_from_stage_and_sequence(stage_and_sequence).map_err(
@@ -228,8 +241,13 @@ fn help_thread<const NUM_THREADS: usize, const NUM_WORDS: usize>(
 
     let sequence: SequenceNum = extract_sequence_from_stage_and_sequence(stage_and_sequence);
     if sequence != encountered_sequence {
+        trace!("sequence {sequence} not equal to the encountered sequence {encountered_sequence}");
         // cannot help an operation which is already finished
-        return Err(HelpError::SequenceChangedWhileHelping { thread_id, original_sequence: encountered_sequence, actual_sequence: sequence });
+        return Err(HelpError::SequenceChangedWhileHelping {
+            thread_id,
+            original_sequence: encountered_sequence,
+            actual_sequence: sequence,
+        });
     }
     match stage {
         Stage::Inactive => Err(HelpError::Fatal(FatalError::IllegalHelpeeStage(
@@ -264,172 +282,130 @@ fn help_thread<const NUM_THREADS: usize, const NUM_WORDS: usize>(
                 )
             },
         ),
-        Stage::Successful | Stage::Reverted => Err(HelpError::HelpeeStageIsAlreadyTerminal(thread_id, stage)),
+        Stage::Successful | Stage::Reverted => {
+            Err(HelpError::HelpeeStageIsAlreadyTerminal(thread_id, stage))
+        }
     }
 }
 
-// #[cfg(test)]
-// #[cfg(loom)]
-// mod loom_tests {
-//     use crate::err::KCasError;
-//     use crate::kcas::{kcas, KCasWord, SharedState};
-//
-//     use loom::thread;
-//
-//     extern crate std;
-//
-//     #[test]
-//     fn test() {
-//         loom::model(|| {
-//
-//         });
-//     }
-//
-// }
-
-#[cfg(test)]
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", test))]
 mod tests {
-    use tracing::debug;
-    use test_log::test;
-    use crate::err::Error;
+    use crate::err::{Error, FatalError};
     use crate::kcas::{kcas, KCasWord, State};
     use crate::sync::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use test_log::test;
+    use tracing::debug;
 
     #[test]
-    fn test_all_targets_are_expected_values() {
+    fn test_when_all_targets_are_expected_values_kcas_succeeds() {
         let state: State<1, 3> = State::new();
 
-        let first_location: AtomicUsize = AtomicUsize::new(50);
-        let second_location: AtomicUsize = AtomicUsize::new(70);
-        let third_location: AtomicUsize = AtomicUsize::new(100);
-        debug!("first_location before kcas: {first_location:?}");
-        debug!("second_location before kcas: {second_location:?}");
-        debug!("third_location before kcas: {third_location:?}");
+        let first_target: AtomicUsize = AtomicUsize::new(0);
+        let second_target: AtomicUsize = AtomicUsize::new(50);
+        let third_target: AtomicUsize = AtomicUsize::new(100);
+
+        debug!("first_target before kcas: {first_target:?}");
+        debug!("second_target before kcas: {second_target:?}");
+        debug!("third_target before kcas: {third_target:?}");
 
         let kcas_words: [KCasWord; 3] = [
-            KCasWord::new(&first_location, 50, 51),
-            KCasWord::new(&second_location, 70, 71),
-            KCasWord::new(&third_location, 100, 101),
+            KCasWord::new(&first_target, 0, 1),
+            KCasWord::new(&second_target, 50, 51),
+            KCasWord::new(&third_target, 100, 101),
         ];
 
-        assert!(kcas(&state, 1, kcas_words).is_ok());
+        let result: Result<(), Error> = kcas(&state, 1, kcas_words);
+        debug!("kcas result: {result:?}");
+        debug!("first_target after kcas: {first_target:?}");
+        debug!("second_target after kcas: {second_target:?}");
+        debug!("third_target after kcas: {third_target:?}");
 
-        debug!("first_location after kcas: {first_location:?}");
-        debug!("second_location after kcas: {second_location:?}");
-        debug!("third_location after kcas: {third_location:?}");
-
-        let first_location_address_v2: &AtomicUsize = &first_location;
-        let second_location_address_v2: &AtomicUsize = &second_location;
-        let third_location_address_v2: &AtomicUsize = &third_location;
-
-        let kcas_words: [KCasWord; 3] = [
-            KCasWord::new(first_location_address_v2, 51, 52),
-            KCasWord::new(second_location_address_v2, 71, 72),
-            KCasWord::new(third_location_address_v2, 101, 102),
-        ];
-
-        assert!(kcas(&state, 1, kcas_words).is_ok());
+        assert!(result.is_ok());
+        assert_eq!(first_target.load(Ordering::Acquire), 1);
+        assert_eq!(second_target.load(Ordering::Acquire), 51);
+        assert_eq!(third_target.load(Ordering::Acquire), 101);
     }
 
     #[test]
-    fn test_a_target_is_unexpected_value() {
+    fn test_when_a_target_is_an_unexpected_value_kcas_fails() {
         let state: State<1, 3> = State::new();
 
-        let first_location: AtomicUsize = AtomicUsize::new(50);
-        let second_location: AtomicUsize = AtomicUsize::new(70);
-        let third_location: AtomicUsize = AtomicUsize::new(90);
-        debug!("first_location before kcas: {first_location:?}");
-        debug!("second_location before kcas: {second_location:?}");
-        debug!("third_location before kcas: {third_location:?}");
+        let first_target: AtomicUsize = AtomicUsize::new(0);
+        let second_target: AtomicUsize = AtomicUsize::new(50);
+        let third_target: AtomicUsize = AtomicUsize::new(100);
+
+        debug!("first_target before kcas: {first_target:?}");
+        debug!("second_target before kcas: {second_target:?}");
+        debug!("third_target before kcas: {third_target:?}");
 
         let kcas_words: [KCasWord; 3] = [
-            KCasWord::new(&first_location, 50, 51),
-            KCasWord::new(&second_location, 70, 71),
-            KCasWord::new(&third_location, 100, 101),
+            KCasWord::new(&first_target, 0, 51),
+            KCasWord::new(&second_target, 50, 51),
+            // this should fail the operation
+            KCasWord::new(&third_target, 99, 101),
         ];
 
-        let error: Error = kcas(&state, 1, kcas_words).unwrap_err();
-        assert!(matches!(error, Error::ValueWasNotExpectedValue));
-    }
-    //
-    // #[test]
-    // fn test_if_drop_is_called_with_arc() {
-    //     let shared_state: SharedState<1, 3> = SharedState::new();
-    //     println!("Shared state after initialization: {:?}", shared_state);
-    //     // let shared_state_pointer: *mut SharedState<1, 3> = &shared_state;
-    //
-    //     let shared_state_arc: Arc<SharedState<1, 3>> = Arc::new(shared_state);
-    //     let shared_state_arc_clone:  Arc<SharedState<1, 3>> = shared_state_arc.clone();
-    //     let join_handle: std::thread::JoinHandle<()> = std::thread::spawn(move || {
-    //         println!("inside child thread now");
-    //         // let inner_shared_state: &SharedState<1, 3> = shared_state_pointer.as_ref().unwrap();
-    //         let inner_shared_state: &SharedState<1, 3> = shared_state_arc_clone.as_ref();
-    //         println!("Obtained reference to shared state using a pointer: {:?}", inner_shared_state);
-    //     });
-    //
-    //     join_handle.join();
-    //     println!("test method finishing");
-    // }
-    //
-    // #[test]
-    // fn test_if_drop_is_called_with_raw_pointer() {
-    //     let shared_state: SharedState<1, 3> = SharedState::new();
-    //     println!("Shared state after initialization: {:?}", shared_state);
-    //     let shared_state_pointer: *mut SharedState<1, 3> = &shared_state;
-    //     let shared_state_ref: &SharedState<1, 3> = unsafe { shared_state_pointer.as_ref() }.unwrap();
-    //     println!("Shared state ref: {:?}", shared_state_ref);
-    //     println!("test method finishing");
-    // }
-    //
-    // #[test]
-    // fn test_unsafe_wrapper_with_raw_pointer() {
-    //     let shared_state: SharedState<3, 3> = SharedState::new();
-    //
-    //     let first_wrapper: UnsafeKCasStateWrapper<3, 3> = UnsafeKCasStateWrapper::construct(&shared_state).unwrap();
-    //     println!("first wrapper: {:?}", first_wrapper);
-    //
-    //     let second_wrapper: UnsafeKCasStateWrapper<3, 3> = UnsafeKCasStateWrapper::construct(&shared_state).unwrap();
-    //     println!("second wrapper: {:?}", second_wrapper);
-    //
-    //     {
-    //         let third_wrapper: UnsafeKCasStateWrapper<3, 3> = UnsafeKCasStateWrapper::construct(&shared_state).unwrap();
-    //         println!("third wrapper: {:?}", third_wrapper);
-    //     }
-    //
-    //     let fourth_wrapper: UnsafeKCasStateWrapper<3, 3> = UnsafeKCasStateWrapper::construct(&shared_state).unwrap();
-    //     println!("fourth wrapper: {:?}", fourth_wrapper);
-    // }
+        let result: Result<(), Error> = kcas(&state, 1, kcas_words);
+        debug!("kcas result: {result:?}");
+        debug!("first_target after kcas: {first_target:?}");
+        debug!("second_target after kcas: {second_target:?}");
+        debug!("third_target after kcas: {third_target:?}");
 
-    // #[test]
-    // fn test_multiple_threads() {
-    //     let shared_state: SharedState<1, 3> = SharedState::new();
-    //     thread::spawn(|| {
-    //
-    //     });
-    //     let mut first_location: usize = 50;
-    //     let mut second_location: usize = 70;
-    //     let mut third_location: usize = 100;
-    //     println!("Initial first_location: {first_location}");
-    //     println!("Initial second_location: {second_location}");
-    //     println!("Initial third_location: {third_location}");
-    //     let kcas_words: [KCasWord; 3] = [
-    //         KCasWord::new(&mut first_location, 50, 51),
-    //         KCasWord::new(&mut second_location, 70, 71),
-    //         KCasWord::new(&mut third_location, 100, 101),
-    //     ];
-    //     let error: KCasError = kcas(&shared_state, 1, kcas_words)
-    //         .unwrap_err();
-    //     assert!(matches!(error, KCasError::ValueWasNotExpectedValue));
-    //
-    //     println!("After KCAS first_location: {first_location}");
-    //     println!("After KCAS second_location: {second_location}");
-    //     println!("After KCAS third_location: {third_location}");
-    // }
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), Error::ValueWasNotExpectedValue);
+    }
 
     #[test]
-    fn test_stuff() {
-        let (x, _) = (3, 4);
+    fn test_when_a_value_is_all_1s_kcas_succeeds() {
+        let state: State<1, 2> = State::new();
 
+        let first_target: AtomicUsize = AtomicUsize::new(0);
+        let second_target: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+        debug!("first_target before kcas: {first_target:?}");
+        debug!("second_target before kcas: {second_target:?}");
+
+        let kcas_words: [KCasWord; 2] = [
+            KCasWord::new(&first_target, 0, 1),
+            KCasWord::new(&second_target, usize::MAX, usize::MAX - 1),
+        ];
+
+        let result: Result<(), Error> = kcas(&state, 1, kcas_words);
+        debug!("kcas result: {result:?}");
+        debug!("first_target after kcas: {first_target:?}");
+        debug!("second_target after kcas: {second_target:?}");
+
+        assert!(result.is_ok());
+        assert_eq!(first_target.load(Ordering::Acquire), 1);
+        assert_eq!(second_target.load(Ordering::Acquire), usize::MAX - 1);
+    }
+
+    #[test]
+    fn test_when_a_value_violates_thread_id_space_kcas_fails() {
+        let state: State<4, 2> = State::new();
+
+        let illegal_value: usize = 5usize << (usize::BITS - 3);
+        let first_target: AtomicUsize = AtomicUsize::new(0);
+        let second_target: AtomicUsize = AtomicUsize::new(illegal_value);
+
+        debug!("first_target before kcas: {first_target:?}");
+        debug!("second_target before kcas: {second_target:?}");
+
+        let kcas_words: [KCasWord; 2] = [
+            KCasWord::new(&first_target, 0, 1),
+            KCasWord::new(&second_target, 0, 1),
+        ];
+
+        let result: Result<(), Error> = kcas(&state, 1, kcas_words);
+        debug!("kcas result: {result:?}");
+        debug!("first_target after kcas: {first_target:?}");
+        debug!("second_target after kcas: {second_target:?}");
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            Error::Fatal(e) if matches!(e, FatalError::TopBitsOfValueWereIllegal { .. })
+        ));
     }
 }

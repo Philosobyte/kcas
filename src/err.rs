@@ -1,12 +1,12 @@
 use crate::types::{Stage, ThreadId, WordNum};
-use core::fmt::{Display, Pointer, Write};
 use displaydoc::Display;
 
-#[derive(Debug, Display)]
+/// Any error which can occur during a k-CAS operation.
+#[derive(Debug, Display, Eq, PartialEq)]
 pub enum Error {
-    /// An unrecoverable error occurred and in-flight changes may not have been cleaned up: {_0}
+    /// An unrecoverable error occurred and in-flight changes may not have been cleaned up: {0}
     Fatal(FatalError),
-    /// The value at one of the target addresses was not the expected value. All changes were
+    /// The value at one of the target addresses was not equal to the expected value.
     ValueWasNotExpectedValue,
 }
 
@@ -16,7 +16,8 @@ impl From<FatalError> for Error {
     }
 }
 
-#[derive(Debug, Display)]
+/// An unrecoverable error.
+#[derive(Debug, Display, Eq, PartialEq)]
 pub enum FatalError {
     /// Tried to deserialize a number as a stage, but it does not correlate to a valid stage: {0}
     StageOutOfBounds(usize),
@@ -36,15 +37,15 @@ pub enum FatalError {
         target_address: usize,
     },
 
-    /** The sequence number indicating the current KCAS operation was changed by a thread other than
+    /** The sequence number of the current KCAS operation was changed by a thread other than
         the originating thread {originating_thread_id}, which should not be possible.
-     */
+    */
     SequenceNumChangedByNonOriginatingThread { originating_thread_id: ThreadId },
 
     /** While setting the target address {target_address} at word number {word_num} to the desired
         value, a CAS failure indicated the current value at the address was not a claim marker, but
         instead {actual_value}, which should not be possible.
-     */
+    */
     TriedToSetValueWhichWasNotClaimMarker {
         word_num: WordNum,
         target_address: usize,
@@ -54,11 +55,12 @@ pub enum FatalError {
         word number {word_num} were not expected. These bits are reserved for kcas internal thread
         identifiers and should not be used for real information: the only allowed values are either
         all 0s or all 1s.
-     */
+    */
     TopBitsOfValueWereIllegal {
         word_num: WordNum,
         target_address: usize,
         value: usize,
+        /// the most significant bits
         num_reserved_bits: usize,
     },
     ///
@@ -71,5 +73,6 @@ impl From<StageOutOfBoundsError> for FatalError {
     }
 }
 
+/// Attempted to convert a usize into a Stage but it was out of bounds: {0}
 #[derive(Debug, Display, Eq, PartialEq)]
 pub struct StageOutOfBoundsError(pub(crate) usize);

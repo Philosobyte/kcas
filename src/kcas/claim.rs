@@ -18,13 +18,12 @@ use crate::types::{
 };
 use displaydoc::Display;
 
-#[cfg(feature = "tracing")]
-use tracing::instrument;
+use tracing::{instrument, trace};
 
 /// Claim target addresses by swapping out expected values for [ThreadAndSequence] markers. Then,
 /// move on to the [enum@Stage::Setting] stage if all values were expected; otherwise, move on to
 /// [enum@Stage::Reverting].
-#[cfg_attr(feature = "tracing", instrument)]
+#[instrument]
 pub(super) fn claim_and_transition<const NUM_THREADS: usize, const NUM_WORDS: usize>(
     shared_state: &State<NUM_THREADS, NUM_WORDS>,
     thread_index: ThreadIndex,
@@ -66,17 +65,19 @@ pub(super) fn claim_and_transition<const NUM_THREADS: usize, const NUM_WORDS: us
             Stage::Claiming,
             Stage::Reverting,
             // then revert
-            ||  revert_and_transition(
-                shared_state,
-                thread_index,
-                thread_and_sequence,
-                word_num,
-                || {
-                    // then skip setting the stage to Reverted and just reset state
-                    prepare_for_next_operation(shared_state, thread_index, sequence);
-                    Err(Error::ValueWasNotExpectedValue)
-                },
-            ),
+            || {
+                revert_and_transition(
+                    shared_state,
+                    thread_index,
+                    thread_and_sequence,
+                    word_num,
+                    || {
+                        // then skip setting the stage to Reverted and just reset state
+                        prepare_for_next_operation(shared_state, thread_index, sequence);
+                        Err(Error::ValueWasNotExpectedValue)
+                    },
+                )
+            },
         ),
         ClaimError::TargetAddressWasNotValidPointer {
             word_num,
@@ -103,7 +104,7 @@ pub(super) fn claim_and_transition<const NUM_THREADS: usize, const NUM_WORDS: us
 /// Help another thread claim target addresses by swapping out expected values for
 /// [ThreadAndSequence] markers. Then, move on to the [enum@Stage::Setting] stage if all values were
 /// expected; otherwise, move on to [enum@Stage::Reverting].
-#[cfg_attr(feature = "tracing", instrument)]
+#[instrument]
 pub(super) fn help_claim_and_transition<const NUM_THREADS: usize, const NUM_WORDS: usize>(
     shared_state: &State<NUM_THREADS, NUM_WORDS>,
     thread_index: ThreadIndex,
@@ -124,17 +125,16 @@ pub(super) fn help_claim_and_transition<const NUM_THREADS: usize, const NUM_WORD
         );
     }
     match claim_result.unwrap_err() {
-        ClaimError::StageAndSequenceVerificationError {
-            error,
-            ..
-        } => help_handle_concurrent_stage_and_sequence_verification_error_and_transition(
-            shared_state,
-            thread_index,
-            sequence,
-            thread_and_sequence,
-            Stage::Claiming,
-            error,
-        ),
+        ClaimError::StageAndSequenceVerificationError { error, .. } => {
+            help_handle_concurrent_stage_and_sequence_verification_error_and_transition(
+                shared_state,
+                thread_index,
+                sequence,
+                thread_and_sequence,
+                Stage::Claiming,
+                error,
+            )
+        }
         // change the stage to Reverting first
         ClaimError::ValueWasNotExpectedValue { word_num, .. } => help_change_stage_and_transition(
             shared_state,
@@ -151,15 +151,17 @@ pub(super) fn help_claim_and_transition<const NUM_THREADS: usize, const NUM_WORD
                     thread_and_sequence,
                     word_num,
                     // then change the stage to Reverted
-                    || help_change_stage_and_transition(
-                        shared_state,
-                        thread_index,
-                        sequence,
-                        thread_and_sequence,
-                        Stage::Reverting,
-                        Stage::Reverted,
-                        || Ok(()),
-                    ),
+                    || {
+                        help_change_stage_and_transition(
+                            shared_state,
+                            thread_index,
+                            sequence,
+                            thread_and_sequence,
+                            Stage::Reverting,
+                            Stage::Reverted,
+                            || Ok(()),
+                        )
+                    },
                 )
             },
         ),
@@ -190,15 +192,15 @@ pub(super) fn help_claim_and_transition<const NUM_THREADS: usize, const NUM_WORD
 #[derive(Debug, Display)]
 enum ClaimError {
     /** The stage or sequence changed while attempting to claim the target address at word
-        {failed_word_num}: {error}
-     */
+       {failed_word_num}: {error}
+    */
     StageAndSequenceVerificationError {
         failed_word_num: WordNum,
         error: StageAndSequenceVerificationError,
     },
     /** The value at word number {word_num} and target address {target_address} was not the
-        expected value but was instead: {actual_value}
-     */
+       expected value but was instead: {actual_value}
+    */
     ValueWasNotExpectedValue {
         word_num: WordNum,
         target_address: usize,
@@ -223,7 +225,7 @@ enum ClaimError {
 }
 
 /// Claim target addresses by swapping out expected values for [ThreadAndSequence] markers.
-#[cfg_attr(feature = "tracing", instrument)]
+#[instrument]
 fn claim<const NUM_THREADS: usize, const NUM_WORDS: usize>(
     state: &State<NUM_THREADS, NUM_WORDS>,
     thread_index: ThreadIndex,
@@ -235,26 +237,30 @@ fn claim<const NUM_THREADS: usize, const NUM_WORDS: usize>(
             &state.target_addresses[thread_index][word_num];
         let target_address_ptr: *mut AtomicUsize = target_address_ptr.load(Ordering::Acquire);
 
-        let target_address: &AtomicUsize = unsafe { target_address_ptr.as_ref() }
-            .ok_or(ClaimError::TargetAddressWasNotValidPointer {
-                word_num,
+        let target_address: &AtomicUsize = unsafe { target_address_ptr.as_ref() }.ok_or(
+            ClaimError::TargetAddressWasNotValidPointer {
+                word_num: word_num,
                 target_address: target_address_ptr as usize,
-            })?;
+            },
+        )?;
 
-        let expected_element: usize =
+        let expected_value: usize =
             state.expected_values[thread_index][word_num].load(Ordering::Acquire);
 
+        trace!("thread_index {thread_index}: CASing for word num {word_num}");
         'cas_loop: while let Err(actual_value) = target_address.compare_exchange_weak(
-            expected_element,
+            expected_value,
             thread_and_sequence,
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
-            if actual_value == expected_element {
+            if actual_value == expected_value {
+                trace!("thread_index {thread_index}: actual value {actual_value} was equal to expected value");
                 continue 'cas_loop;
             }
             if actual_value == thread_and_sequence {
                 // value is already the marker we wanted
+                trace!("thread_index {thread_index}: actual value {actual_value} was already the thread and sequence marker");
                 break 'cas_loop;
             }
 
@@ -272,30 +278,36 @@ fn claim<const NUM_THREADS: usize, const NUM_WORDS: usize>(
 
             // in case the value is a pointer, canonical pointers typically set all the bits
             // above virtual address space to either 0 or 1
-            let bit_length_of_num_threads: usize =
-                get_bit_length_of_num_threads::<NUM_THREADS>();
+            let bit_length_of_num_threads: usize = get_bit_length_of_num_threads::<NUM_THREADS>();
             let num_sequence_bits: usize = usize::BITS as usize - bit_length_of_num_threads;
             let top_bits_if_value_is_kernel_pointer: usize = usize::MAX >> num_sequence_bits;
 
-            let top_bits: usize = extract_thread_from_thread_and_sequence::<NUM_THREADS>(actual_value);
+            let top_bits: usize =
+                extract_thread_from_thread_and_sequence::<NUM_THREADS>(actual_value);
 
             if top_bits == 0 || top_bits == top_bits_if_value_is_kernel_pointer {
                 // happy path for a CAS failure
+                trace!("thread_index {thread_index}: actual value {actual_value} was not expected value {expected_value}");
                 return Err(ClaimError::ValueWasNotExpectedValue {
                     word_num,
                     target_address: target_address_ptr as usize,
                     actual_value,
                 });
             } else if top_bits <= NUM_THREADS {
-                // the top bits were a ThreadId
+                trace!("thread_index {thread_index}: need to help thread with id {top_bits}");
                 let help_result: Result<(), HelpError> = help_thread(state, actual_value);
                 if help_result.is_ok() {
                     // The other thread's ThreadAndSequence should be gone. Try again.
+                    trace!(
+                        "thread_index {thread_index}: finished helping thread with id {top_bits}"
+                    );
                     continue 'cas_loop;
                 }
                 let help_error: HelpError = help_result.unwrap_err();
+                trace!("thread_index {thread_index}: failed to help thread with id {top_bits}: {help_error}");
                 match help_error {
-                    HelpError::SequenceChangedWhileHelping { .. } | HelpError::HelpeeStageIsAlreadyTerminal(..) => {
+                    HelpError::SequenceChangedWhileHelping { .. }
+                    | HelpError::HelpeeStageIsAlreadyTerminal(..) => {
                         // Either of these means the other thread's ThreadAndSequence should be
                         // gone. Try again.
                         continue 'cas_loop;
@@ -306,13 +318,14 @@ fn claim<const NUM_THREADS: usize, const NUM_WORDS: usize>(
                 }
             } else {
                 return Err(ClaimError::TopBitsOfValueWereIllegal {
-                    word_num,
+                    word_num: word_num,
                     target_address: target_address_ptr as usize,
                     value: actual_value,
                     num_reserved_bits: bit_length_of_num_threads,
                 });
             }
         }
+        trace!("thread_index {thread_index}: CAS succeeded");
     }
     Ok(())
 }
