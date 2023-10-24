@@ -36,6 +36,8 @@ fn find_next_available_thread_index<const NUM_THREADS: usize, const NUM_WORDS: u
     Err(NoThreadIdAvailableError)
 }
 
+/// An error which occurs while performing operations specific to [ArcStateWrapper], such as
+/// attempting to construct one.
 #[derive(Debug, Display)]
 pub enum ArcStateWrapperError {
     /** Could not construct [ArcStateWrapper] because all thread slots for the provided [State] are
@@ -50,6 +52,11 @@ impl From<NoThreadIdAvailableError> for ArcStateWrapperError {
     }
 }
 
+/// A wrapper for performing k-CAS operations which stores [State] inside an `Arc`. This makes it
+/// convenient to use [ArcStateWrapper] when threads might outlive the functions which created them.
+///
+/// `NUM_THREADS` is the maximum number of threads which can run `kcas` on the provided [State].
+/// `NUM_WORDS` is the number of words to operate on during each k-CAS operation.
 #[derive(Debug)]
 #[cfg(any(feature = "std", feature = "alloc"))]
 pub struct ArcStateWrapper<const NUM_THREADS: usize, const NUM_WORDS: usize> {
@@ -59,6 +66,8 @@ pub struct ArcStateWrapper<const NUM_THREADS: usize, const NUM_WORDS: usize> {
 
 #[cfg(any(feature = "std", feature = "alloc"))]
 impl<const NUM_THREADS: usize, const NUM_WORDS: usize> ArcStateWrapper<NUM_THREADS, NUM_WORDS> {
+    /// Instantiate a new [ArcStateWrapper] and claim a thread slot in the provided [State]. This
+    /// function fails if all thread slots for the provided [State] are already in use.
     pub fn construct(
         state: Arc<State<NUM_THREADS, NUM_WORDS>>,
     ) -> Result<Self, ArcStateWrapperError> {
@@ -71,6 +80,8 @@ impl<const NUM_THREADS: usize, const NUM_WORDS: usize> ArcStateWrapper<NUM_THREA
         })
     }
 
+    /// Perform a k-CAS operation on the target addresses specified in the provided [KCasWord]s in
+    /// sequential order.
     #[instrument]
     pub fn kcas(&mut self, kcas_words: [KCasWord; NUM_WORDS]) -> Result<(), Error> {
         let shared_state: &State<NUM_THREADS, NUM_WORDS> = self.shared_state.as_ref();
@@ -93,6 +104,8 @@ impl<const NUM_THREADS: usize, const NUM_WORDS: usize> Drop
     }
 }
 
+/// An error which occurs while performing operations specific to [RefStateWrapper], such as
+/// attempting to construct one.
 #[derive(Debug, Display)]
 pub enum RefStateWrapperError {
     /** Could not construct [RefStateWrapper] because all thread slots for the provided [State]
@@ -107,6 +120,11 @@ impl From<NoThreadIdAvailableError> for RefStateWrapperError {
     }
 }
 
+/// A wrapper for performing k-CAS operations which stores [State] as a reference. This makes it
+/// suited for scenarios where threads will not outlive the functions which created them.
+///
+/// `NUM_THREADS` is the maximum number of threads which can run `kcas` on the provided [State].
+/// `NUM_WORDS` is the number of words to operate on during each k-CAS operation.
 #[derive(Debug)]
 pub struct RefStateWrapper<'a, const NUM_THREADS: usize, const NUM_WORDS: usize> {
     shared_state: &'a State<NUM_THREADS, NUM_WORDS>,
@@ -116,6 +134,8 @@ pub struct RefStateWrapper<'a, const NUM_THREADS: usize, const NUM_WORDS: usize>
 impl<'a, const NUM_THREADS: usize, const NUM_WORDS: usize>
     RefStateWrapper<'a, NUM_THREADS, NUM_WORDS>
 {
+    /// Instantiate a new [RefStateWrapper] and claim a thread slot in the provided [State]. This
+    /// function fails if all thread slots for the provided [State] are already in use.
     pub fn construct(
         shared_state: &'a State<NUM_THREADS, NUM_WORDS>,
     ) -> Result<Self, RefStateWrapperError> {
@@ -126,6 +146,8 @@ impl<'a, const NUM_THREADS: usize, const NUM_WORDS: usize>
         })
     }
 
+    /// Perform a k-CAS operation on the target addresses specified in the provided [KCasWord]s in
+    /// sequential order.
     #[instrument]
     pub fn kcas(&mut self, kcas_words: [KCasWord; NUM_WORDS]) -> Result<(), Error> {
         crate::kcas::kcas(self.shared_state, self.thread_id, kcas_words)
@@ -145,6 +167,8 @@ impl<'a, const NUM_THREADS: usize, const NUM_WORDS: usize> Drop
     }
 }
 
+/// An error which occurs while performing operations specific to [UnsafeStateWrapper], such as
+/// attempting to construct one.
 #[derive(Debug, Display)]
 pub enum UnsafeStateWrapperError {
     /** Could not construct [UnsafeStateWrapper] because all thread slots for the provided [State]
@@ -159,6 +183,13 @@ impl From<NoThreadIdAvailableError> for UnsafeStateWrapperError {
     }
 }
 
+/// A wrapper for performing k-CAS operations which stores [State] as an unsafe [NonNull]. This
+/// makes it suited for scenarios where the user would like complete control over where the [State]
+/// lives and how it is made available across threads. The user is responsible for dropping
+/// [State] after all threads are finished using it.
+///
+/// `NUM_THREADS` is the maximum number of threads which can run `kcas` on the provided [State].
+/// `NUM_WORDS` is the number of words to operate on during each k-CAS operation.
 #[derive(Debug)]
 pub struct UnsafeStateWrapper<const NUM_THREADS: usize, const NUM_WORDS: usize> {
     shared_state: NonNull<State<NUM_THREADS, NUM_WORDS>>,
@@ -166,6 +197,8 @@ pub struct UnsafeStateWrapper<const NUM_THREADS: usize, const NUM_WORDS: usize> 
 }
 
 impl<const NUM_THREADS: usize, const NUM_WORDS: usize> UnsafeStateWrapper<NUM_THREADS, NUM_WORDS> {
+    /// Instantiate a new [UnsafeStateWrapper] and claim a thread slot in the provided [State]. This
+    /// function fails if all thread slots for the provided [State] are already in use.
     pub fn construct(
         shared_state: NonNull<State<NUM_THREADS, NUM_WORDS>>,
     ) -> Result<Self, UnsafeStateWrapperError> {
@@ -177,6 +210,8 @@ impl<const NUM_THREADS: usize, const NUM_WORDS: usize> UnsafeStateWrapper<NUM_TH
         })
     }
 
+    /// Perform a k-CAS operation on the target addresses specified in the provided [KCasWord]s in
+    /// sequential order.
     #[instrument]
     pub fn kcas(&mut self, kcas_words: [KCasWord; NUM_WORDS]) -> Result<(), Error> {
         let shared_state: &State<NUM_THREADS, NUM_WORDS> = unsafe { self.shared_state.as_ref() };
@@ -395,6 +430,7 @@ mod tests {
     fn test_unsafe_state_wrapper_with_2_threads() {
         test_unsafe_state_wrapper::<2, 3>();
     }
+
     fn test_unsafe_state_wrapper<const NUM_THREADS: usize, const NUM_WORDS: usize>() {
         let state: State<NUM_THREADS, NUM_WORDS> = State::new();
         let state_pointer: NonNull<State<NUM_THREADS, NUM_WORDS>> = NonNull::from(&state);

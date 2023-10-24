@@ -75,4 +75,4 @@ impl From<StageOutOfBoundsError> for FatalError {
 
 /// Attempted to convert a usize into a Stage but it was out of bounds: {0}
 #[derive(Debug, Display, Eq, PartialEq)]
-pub struct StageOutOfBoundsError(pub(crate) usize);
+pub(crate) struct StageOutOfBoundsError(pub(crate) usize);

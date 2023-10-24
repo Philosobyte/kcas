@@ -23,23 +23,17 @@ mod stage_change;
 
 /// A structure containing all the information needed to perform a single CAS operation.
 ///
-/// `target_address` is a reference whose value should be compared and swapped. Values
 /// `expected_element` and `desired_element` can be any usize, including a thin pointer, as long as
 /// the most significant bits are either all 0s or all 1s. The number of bits which must follow
-/// this rule scales with `NUM_THREADS`. For example, on a 64-bit system, if we would like the
-/// lower 52 bits to be free to hold arbitrary content, then the maximum allowed `NUM_THREADS` is
-/// 4096, since that is the largest number which fits in `(64 - 52) = 12` bits.
-///
-/// These bits are used
-/// internally by kcas to differentiate between temporary [ThreadAndSequence] markers and real
-/// values.
-///
-/// The reason the most significant bits in values are allowed to be either all 0s or all 1s is to
-/// allow sign extension, which is required by canonical pointers in some operating systems.
+/// this rule scales with `NUM_THREADS`. For more information, see the `Limitations` section of the
+/// docs at the root of the crate.
 #[derive(Clone, Debug)]
 pub struct KCasWord<'a> {
+    /// a reference whose value should be compared and swapped
     target_address: &'a AtomicUsize,
+    /// the value expected to be at `target_address` before the operation
     expected_value: usize,
+    /// the value to swap into `target_address` if the value is currently `expected_value`
     desired_value: usize,
 }
 
