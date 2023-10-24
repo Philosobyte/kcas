@@ -9,7 +9,7 @@
 //! Here is an example using [RefStateWrapper]:
 //! ```edition2021
 //! use kcas::{KCasWord, State, RefStateWrapper};
-//! use kcas::err::Error;
+//! use kcas::Error;
 //! use std::sync::atomic::{AtomicUsize, Ordering};
 //! use std::thread::{ScopedJoinHandle};
 //!
@@ -123,15 +123,16 @@
 //!
 #![warn(missing_debug_implementations, missing_docs)]
 
-pub mod err;
+mod err;
 mod kcas;
 mod sync;
 mod types;
 mod wrapper;
 
+pub use err::{Error, FatalError, StageOutOfBoundsError};
 pub use kcas::{KCasWord, State};
+pub use types::{get_bit_length_of_num_threads, is_value_a_kcas_marker};
 pub use wrapper::{
     ArcStateWrapper, ArcStateWrapperError, RefStateWrapper, RefStateWrapperError,
     UnsafeStateWrapper, UnsafeStateWrapperError,
 };
-pub use types::{get_bit_length_of_num_threads, is_value_a_kcas_marker};
