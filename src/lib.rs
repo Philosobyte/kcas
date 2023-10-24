@@ -129,7 +129,7 @@ mod sync;
 mod types;
 mod wrapper;
 
-pub use err::{Error, FatalError};
+pub use err::{Error, FatalError, StageOutOfBoundsError};
 pub use kcas::{KCasWord, State};
 pub use types::{get_bit_length_of_num_threads, is_value_a_kcas_marker};
 pub use wrapper::{
