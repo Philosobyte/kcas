@@ -1,0 +1,30 @@
+[package]
+name = "kcas"
+version = "0.1.0"
+authors = ["Raymond Liu <philosobyte@gmail.com>"]
+categories = ["concurrency", "algorithms", "memory-management", "no-std::no-alloc"]
+description = "A lock-free, allocation-free multi-word compare-and-swap library"
+edition = "2021"
+keywords = ["mwcas", "mcas", "cas", "lock-free"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Philosobyte/kcas"
+rust-version = "1.63"
+resolver = "2"
+
+[dependencies]
+cfg-if = "1.0"
+displaydoc = { version = "0.2", default-features = false }
+shuttle = { version = "0.6", required = false }
+tracing = { version = "0.1", default-features = false, features = ["attributes", "release_max_level_off"] }
+
+[dev-dependencies]
+test-log = { version = "0.2", default-features = false, features = ["trace"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[target.'cfg(loom)'.dependencies]
+loom = { version = "0.7", features = ["checkpoint"] }
+
+[features]
+default = ["std"]
+alloc = []
+std = []
