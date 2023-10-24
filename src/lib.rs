@@ -68,12 +68,12 @@
 //! Next, wrap [State] in a "wrapper" implementation. Each wrapper reserves a thread id from the
 //! underlying [State] and thus is designed to execute k-CAS operations for exactly one thread at a
 //! time. There are three wrapper implementations:
-//! - [RefStateWrapper]'s constructor takes a `&[State]` where [State] typically lives on the stack.
+//! - [RefStateWrapper]'s constructor takes a `&State` where [State] typically lives on the stack.
 //! [std::thread::scope] allows borrowing [RefStateWrapper] across threads.
-//! - [ArcStateWrapper]'s constructor takes `[alloc::sync::Arc]<[State]>` where [State] lives on the
-//! heap and the [alloc::sync::Arc] is cloned and moved across threads. This can only be used in a
+//! - [ArcStateWrapper]'s constructor takes `Arc<State>` where [State] lives on the
+//! heap and the `Arc` is cloned and moved across threads. This can only be used in a
 //! `std` environment or a `no_std` environment which uses [alloc].
-//! - [UnsafeStateWrapper]'s constructor takes a `[core::ptr::NonNull]<[State]>` for greater control
+//! - [UnsafeStateWrapper]'s constructor takes a `NonNull<State>` for greater control
 //! over where [State] lives and how it is used across threads.
 //!
 //! Next, call the wrapper's `kcas` method, which performs the k-CAS operation defined by its
@@ -115,7 +115,7 @@
 //! - for 57-bit 5-level paging pointers, you may set `NUM_THREADS` as high as `2^7` or `128`.
 //!
 //! To programmatically determine how many value bits are reserved by the KCAS library, you may call
-//! [fn@types::get_bit_length_of_num_threads].
+//! [get_bit_length_of_num_threads].
 //!
 //! We plan to remove this limitation in the future by introducing an alternative implementation
 //! where tagged markers do not scale with the number of threads. This design will rely on a
@@ -134,3 +134,4 @@ pub use wrapper::{
     ArcStateWrapper, ArcStateWrapperError, RefStateWrapper, RefStateWrapperError,
     UnsafeStateWrapper, UnsafeStateWrapperError,
 };
+pub use types::{get_bit_length_of_num_threads, is_value_a_kcas_marker};

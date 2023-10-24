@@ -148,7 +148,7 @@ pub const fn is_value_a_kcas_marker<const NUM_THREADS: usize>(value: usize) -> b
 /// `(NUM_THREADS + 1)`. For example, a `NUM_THREADS` value of 32 means 6 bits are allocated to
 /// [ThreadId], since the bit length of (32 + 1) or 33 is 5. On a 64-bit system, the remaining 59
 /// bits are allocated to the sequence number.
-pub(crate) const fn get_bit_length_of_num_threads<const NUM_THREADS: usize>() -> usize {
+pub const fn get_bit_length_of_num_threads<const NUM_THREADS: usize>() -> usize {
     let num_threads_plus_one: usize = NUM_THREADS + 1;
     // can't use a for loop because iterators are not available in constant functions:
     // https://github.com/rust-lang/rust/issues/87575

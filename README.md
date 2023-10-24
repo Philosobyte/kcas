@@ -35,3 +35,14 @@ This mechanism may also make the algorithm wait-free.
 
 ## License
 This library may be used under either the [MIT License] or [Apache License (Version 2.0)].
+
+[build status]: https://img.shields.io/github/actions/workflow/status/philosobyte/kcas/ci.yml?branch=main
+[actions]: https://github.com/philosobyte/kcas/actions?query=branch%3Amain
+[docs]: https://docs.rs/kcas/badge.svg
+[`kcas` documentation]: https://docs.rs/kcas
+[rustc version 1.63+]: https://img.shields.io/badge/rustc-1.63+-lightgray.svg
+[rust 1.63]: https://blog.rust-lang.org/2022/08/11/Rust-1.63.0.html
+[kcas latest version]: https://img.shields.io/crates/v/kcas.svg
+[kcas crates.io]: https://crates.io/crates/kcas
+[MIT License]: https://github.com/philosobyte/kcas/LICENSE-MIT
+[Apache License (Version 2.0)]: https://github.com/philosobyte/kcas/LICENSE-APACHE

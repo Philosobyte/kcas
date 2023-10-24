@@ -32,7 +32,7 @@ pub(crate) fn concurrency_test<const NUM_THREADS: usize, const NUM_WORDS: usize>
                 ArcStateWrapper::construct(state_arc.clone()).unwrap();
             let cloned_targets: Vec<Arc<AtomicUsize>> = targets
                 .iter()
-                .map(|target_arc| target_arc.clone())
+                .cloned()
                 .collect();
             let handle: thread::JoinHandle<Result<(), Error>> = thread::spawn(move || {
                 let cloned_targets = cloned_targets;
